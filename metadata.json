@@ -1,0 +1,6 @@
+{
+  "name": "MindFlow AI",
+  "description": "Transform YouTube lectures into interactive mindmaps, structured cheat sheets, and searchable timestamped scripts with live YouTube timestamp sync.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

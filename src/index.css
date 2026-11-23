@@ -1,0 +1,262 @@
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Plus Jakarta Sans", "Inter", "Noto Sans Devanagari", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Inter", "DM Sans", "Noto Sans Devanagari", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+:root {
+  /* Backgrounds */
+  --mf-bg-canvas: #060812;
+  --mf-bg-deep: #04060d;
+  --mf-bg-elevated: #0b1024;
+
+  /* Surfaces */
+  --mf-surface: rgba(10, 15, 31, 0.9);
+  --mf-surface-strong: rgba(11, 16, 36, 0.96);
+  --mf-surface-subtle: rgba(255, 255, 255, 0.035);
+  --mf-surface-hover: rgba(255, 255, 255, 0.075);
+
+  /* Typography */
+  --mf-text-primary: #f8fafc;
+  --mf-text-secondary: #cbd5e1;
+  --mf-text-muted: #94a3b8;
+
+  /* Borders */
+  --mf-border: rgba(255, 255, 255, 0.09);
+  --mf-border-strong: rgba(255, 255, 255, 0.16);
+  --mf-border-active: rgba(139, 92, 246, 0.45);
+
+  /* Brand Accents */
+  --mf-accent-violet: #8b5cf6;
+  --mf-accent-indigo: #6366f1;
+  --mf-accent-cyan: #22d3ee;
+  --mf-accent-emerald: #34d399;
+
+  /* Elevation */
+  --mf-shadow-panel: 0 10px 28px -12px rgba(2, 6, 23, 0.65);
+  --mf-shadow-modal: 0 24px 64px -16px rgba(2, 6, 23, 0.85);
+  --mf-shadow-active: 0 0 24px rgba(124, 58, 237, 0.24);
+
+  /* Radius Scale */
+  --mf-radius-sm: 0.625rem;
+  --mf-radius-md: 0.875rem;
+  --mf-radius-lg: 1.125rem;
+  --mf-radius-xl: 1.5rem;
+
+  /* Safe-area insets */
+  --mf-safe-bottom: env(safe-area-inset-bottom, 0px);
+  --mf-safe-top: env(safe-area-inset-top, 0px);
+}
+
+@layer base {
+  html,
+  body {
+    font-family: var(--font-sans);
+    background-color: var(--mf-bg-canvas);
+    color: var(--mf-text-primary);
+    overflow-x: hidden;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    font-family: var(--font-display);
+  }
+
+  button:focus-visible,
+  a:focus-visible,
+  input:focus-visible,
+  textarea:focus-visible,
+  select:focus-visible,
+  [tabindex]:focus-visible {
+    outline: 2px solid rgba(34, 211, 238, 0.78);
+    outline-offset: 2px;
+  }
+}
+
+.mf-panel {
+  background-color: var(--mf-surface);
+  border: 1px solid var(--mf-border);
+  box-shadow: var(--mf-shadow-panel);
+}
+
+.mf-modal-surface {
+  background-color: var(--mf-surface-strong);
+  border: 1px solid var(--mf-border-strong);
+  box-shadow: var(--mf-shadow-modal);
+}
+
+.mindmap-dot-grid {
+  background-image: radial-gradient(rgba(148, 163, 184, 0.13) 1.15px, transparent 1.15px);
+  background-size: 24px 24px;
+}
+
+.ambient-bg {
+  background: radial-gradient(circle at 14% 12%, rgba(124, 58, 237, 0.09) 0%, transparent 40%),
+    radial-gradient(circle at 86% 16%, rgba(6, 182, 212, 0.07) 0%, transparent 38%),
+    radial-gradient(circle at 52% 92%, rgba(79, 70, 229, 0.07) 0%, transparent 44%),
+    linear-gradient(180deg, #060812 0%, #080c19 55%, #0a0e1d 100%);
+}
+
+/* Safe-area spacing helpers for mobile bottom sheets & navigation */
+.mf-safe-bottom-nav {
+  bottom: calc(0.75rem + var(--mf-safe-bottom));
+}
+
+.mf-safe-pb {
+  padding-bottom: calc(1rem + var(--mf-safe-bottom));
+}
+
+.mf-mobile-main-pb {
+  padding-bottom: calc(5.75rem + var(--mf-safe-bottom));
+}
+
+/* Subtle compositor-only UI transitions */
+@keyframes mfFadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes mfModalIn {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 8px, 0) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+@keyframes mfSheetUp {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 18px, 0);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+.mf-animate-fade {
+  animation: mfFadeIn 150ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+.mf-animate-modal {
+  animation: mfModalIn 180ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+.mf-animate-sheet {
+  animation: mfSheetUp 200ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+/* Custom sleek dark scrollbar */
+.glass-scroll::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.glass-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.glass-scroll::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.22);
+  border-radius: 9999px;
+}
+
+.glass-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.38);
+}
+
+/* Visual PDF Guide Magazine Print Engine */
+.pdf-guide-font {
+  font-family: "Inter", "Noto Sans Devanagari", "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+}
+
+.pdf-avoid-break {
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+.pdf-page-break-before {
+  break-before: page;
+  page-break-before: always;
+}
+
+@media print {
+  @page {
+    size: A4 portrait;
+    margin: 10mm;
+  }
+
+  html,
+  body {
+    background: transparent !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: visible !important;
+    print-color-adjust: exact !important;
+    -webkit-print-color-adjust: exact !important;
+  }
+
+  * {
+    print-color-adjust: exact !important;
+    -webkit-print-color-adjust: exact !important;
+  }
+
+  body.mindflow-printing-pdf [data-mindflow-app-shell="true"] {
+    display: none !important;
+  }
+
+  body.mindflow-printing-pdf [data-mindflow-print-hide="true"] {
+    display: none !important;
+  }
+
+  body.mindflow-printing-pdf [data-mindflow-pdf-modal="true"] {
+    position: static !important;
+    inset: auto !important;
+    height: auto !important;
+    max-height: none !important;
+    width: 100% !important;
+    overflow: visible !important;
+    background: transparent !important;
+    padding: 0 !important;
+    display: block !important;
+  }
+
+  body.mindflow-printing-pdf [data-mindflow-pdf-scroll="true"] {
+    overflow: visible !important;
+    height: auto !important;
+    max-height: none !important;
+    padding: 0 !important;
+  }
+
+  body.mindflow-printing-pdf [data-mindflow-pdf-document="true"] {
+    max-width: 100% !important;
+    margin: 0 !important;
+    box-shadow: none !important;
+    border-radius: 0 !important;
+    border: none !important;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
