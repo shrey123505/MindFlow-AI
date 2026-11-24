@@ -9,14 +9,14 @@ import {
   Lightbulb,
   Link2,
   Loader2,
-  LogIn,
   MessageCircle,
   Network,
   Play,
   ScrollText,
+  Share2,
   Sparkles,
   X,
-  UserRound,
+  KeyRound,
 } from 'lucide-react';
 import type {
   ActiveTab,
@@ -28,7 +28,6 @@ import type {
 import { LanguageSwitcher } from './LanguageSwitcher';
 import { NodeIcon } from './NodeIcon';
 import { isSafeHttpUrl } from '../utils/youtube';
-import type { AccountUsage, AccountUser } from '../types/auth';
 
 interface MobileHeaderProps {
   urlOpen: boolean;
@@ -39,16 +38,16 @@ interface MobileHeaderProps {
   isAnalyzing: boolean;
   isTranslating: boolean;
   libraryCount: number;
-  accountUser: AccountUser | null;
-  accountUsage: AccountUsage | null;
+  hasOwnKey: boolean;
   onToggleUrlBar: () => void;
   onUrlChange: (val: string) => void;
   onUrlClear: () => void;
   onUrlSubmit: () => void;
   onLanguageChange: (lang: LanguageCode) => void;
   onOpenLibrary: () => void;
-  onOpenAccount: () => void;
+  onOpenApiKey: () => void;
   onOpenManualTranscript: () => void;
+  onShareLink?: () => void;
 }
 
 export function MobileHeader({
@@ -60,16 +59,16 @@ export function MobileHeader({
   isAnalyzing,
   isTranslating,
   libraryCount,
-  accountUser,
-  accountUsage,
+  hasOwnKey,
   onToggleUrlBar,
   onUrlChange,
   onUrlClear,
   onUrlSubmit,
   onLanguageChange,
   onOpenLibrary,
-  onOpenAccount,
+  onOpenApiKey,
   onOpenManualTranscript,
+  onShareLink,
 }: MobileHeaderProps) {
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
@@ -78,13 +77,13 @@ export function MobileHeader({
 
   return (
     <header className="lg:hidden sticky top-0 z-30 bg-[#060812]/94 backdrop-blur-md border-b border-white/[0.08]">
-      <div className="flex items-center justify-between gap-1.5 px-3 sm:px-4 h-14">
-        <div className="flex items-center gap-2 min-w-0">
-          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-violet-500 via-indigo-500 to-cyan-500 shadow-sm shadow-violet-950/40">
-            <BrainCircuit className="w-4 h-4 text-white" aria-hidden="true" />
+      <div className="flex items-center justify-between gap-1 px-2 sm:px-4 h-14">
+        <div className="flex items-center gap-1.5 sm:gap-2 min-w-0 flex-1 overflow-hidden">
+          <div className="flex h-7 w-7 sm:h-8 sm:w-8 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-violet-500 via-indigo-500 to-cyan-500 shadow-sm shadow-violet-950/40">
+            <BrainCircuit className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-white" aria-hidden="true" />
           </div>
-          <span className="font-display text-[14px] sm:text-[15px] font-bold tracking-[0.01em] text-white whitespace-nowrap">
-            MindFlow AI
+          <span className="font-display text-[13px] sm:text-[15px] font-bold tracking-[0.01em] text-white truncate">
+            MindFlow<span className="hidden min-[400px]:inline"> AI</span>
           </span>
         </div>
 
@@ -96,36 +95,13 @@ export function MobileHeader({
             onChange={onLanguageChange}
           />
 
-          <button
-            type="button"
-            data-testid="mobile-account-btn"
-            onClick={onOpenAccount}
-            aria-label={accountUser ? `Account for ${accountUser.email}` : 'Sign in or create an account'}
-            title={
-              accountUser
-                ? `${accountUsage?.analysesUsed ?? 0}/${accountUsage?.analysisLimit ?? 3} video analyses today`
-                : 'Sign in or create an account'
-            }
-            className="relative flex h-9 w-9 sm:h-10 sm:w-10 items-center justify-center rounded-xl border border-white/10 bg-white/[0.05] text-slate-300 transition-colors hover:text-white cursor-pointer"
-          >
-            {accountUser ? (
-              <UserRound className="h-4 w-4 text-cyan-300" aria-hidden="true" />
-            ) : (
-              <LogIn className="h-4 w-4 text-cyan-300" aria-hidden="true" />
-            )}
-            {accountUser && accountUsage && (
-              <span className="absolute -right-1 -top-1 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-violet-500 px-1 text-[9px] font-bold text-white">
-                {Math.max(0, accountUsage.analysisLimit - accountUsage.analysesUsed)}
-              </span>
-            )}
-          </button>
 
           <button
             type="button"
             data-testid="mobile-library-btn"
             onClick={onOpenLibrary}
             aria-label={`Open saved library (${libraryCount} saved)`}
-            className="relative flex h-9 w-9 sm:h-10 sm:w-10 items-center justify-center rounded-xl border bg-white/[0.05] border-white/10 text-slate-300 hover:text-white transition-colors cursor-pointer"
+            className="relative flex h-8 w-8 sm:h-10 sm:w-10 items-center justify-center rounded-xl border bg-white/[0.05] border-white/10 text-slate-300 hover:text-white transition-colors cursor-pointer shrink-0"
           >
             <FolderClock className="w-4 h-4" aria-hidden="true" />
             {libraryCount > 0 && (
@@ -135,12 +111,25 @@ export function MobileHeader({
             )}
           </button>
 
+          {onShareLink && (
+            <button
+              type="button"
+              data-testid="mobile-share-btn"
+              onClick={onShareLink}
+              aria-label="Share deep link"
+              title="Copy deep link to current video & timestamp"
+              className="flex h-8 w-8 sm:h-10 sm:w-10 items-center justify-center rounded-xl border bg-white/[0.05] border-white/10 text-slate-300 hover:text-white transition-colors cursor-pointer shrink-0"
+            >
+              <Share2 className="w-4 h-4 text-cyan-300" aria-hidden="true" />
+            </button>
+          )}
+
           <button
             type="button"
             onClick={onToggleUrlBar}
             aria-expanded={urlOpen}
             aria-label="Toggle YouTube URL input"
-            className={`flex h-9 w-9 sm:h-10 sm:w-10 items-center justify-center rounded-xl border transition-colors cursor-pointer ${
+            className={`flex h-8 w-8 sm:h-10 sm:w-10 items-center justify-center rounded-xl border transition-colors cursor-pointer shrink-0 ${
               urlOpen
                 ? 'bg-violet-500/22 border-violet-400/45 text-violet-200'
                 : 'bg-white/[0.05] border-white/10 text-slate-300 hover:text-white'
@@ -217,6 +206,15 @@ export function MobileHeader({
               )}
             </div>
           )}
+          <button
+            type="button"
+            data-testid="mobile-apikey-btn"
+            onClick={onOpenApiKey}
+            className="inline-flex items-center gap-1.5 px-2 text-xs font-semibold text-slate-300 hover:text-white cursor-pointer"
+          >
+            <KeyRound className={`h-3.5 w-3.5 ${hasOwnKey ? 'text-emerald-400' : 'text-cyan-300'}`} aria-hidden="true" />
+            {hasOwnKey ? 'Using your own Gemini key' : 'Use your own Gemini key (no daily cap)'}
+          </button>
         </form>
       )}
     </header>

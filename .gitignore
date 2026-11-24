@@ -10,3 +10,7 @@ coverage/
 !.env.example
 .aistudio/artifacts/
 .aistudio/**/.tempmediaStorage/
+
+# AI Studio screenshots/artifacts (large, not source)
+.aistudio/
+data/

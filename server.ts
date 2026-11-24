@@ -3,14 +3,9 @@ import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
 import { timingSafeEqual } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { fileURLToPath } from 'node:url';
 import { GoogleGenAI, ThinkingLevel, Type, type Schema } from '@google/genai';
-import {
-  AuthStoreError,
-  PersistentAuthStore,
-  type AuthUser,
-  type UsagePolicy,
-} from './src/utils/authStore.ts';
 import {
   buildProxyImageUrl,
   buildYouTubeFrameUrl,
@@ -43,6 +38,7 @@ import {
 import {
   compressPlainTextStratified,
   detectContentDomain,
+  ensureFullTimelineCoverage,
   formatStructuredSimplification,
   getAdaptiveScaleProfile,
   getDomainCheatSheetGuidance,
@@ -200,6 +196,66 @@ function stripThinkingConfig(
 }
 
 const modelRateLimitCooldownUntil = new Map<string, number>();
+const keyRateLimitCooldownUntil = new Map<string, number>();
+let keyRoundRobinCursor = 0;
+
+/** Holds a visitor's own Gemini key (sent via x-user-gemini-key) for the duration of one API request. */
+const requestKeyStorage = new AsyncLocalStorage<string>();
+
+function getConfiguredGeminiApiKeys(): string[] {
+  const ownKey = requestKeyStorage.getStore();
+  if (ownKey) return [ownKey];
+  const candidates: string[] = [];
+  const pushRaw = (raw: string | undefined) => {
+    if (!raw) return;
+    for (const part of raw.split(/[\s,;]+/)) {
+      const cleaned = part.trim();
+      if (cleaned && cleaned !== 'MY_GEMINI_API_KEY' && !candidates.includes(cleaned)) {
+        candidates.push(cleaned);
+      }
+    }
+  };
+  pushRaw(process.env.GEMINI_API_KEY);
+  pushRaw(process.env.GEMINI_API_KEYS);
+  pushRaw(process.env.GEMINI_API_KEY_2);
+  pushRaw(process.env.GEMINI_API_KEY_3);
+  pushRaw(process.env.GEMINI_API_KEY_4);
+  pushRaw(process.env.GEMINI_API_KEY_5);
+  return candidates;
+}
+
+function buildGeminiClientForKey(apiKey: string): GoogleGenAI {
+  return new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
+    },
+  });
+}
+
+function pickGeminiClientForAttempt(fallbackClient: GoogleGenAI, now = Date.now()): {
+  client: GoogleGenAI;
+  keyId: string;
+} {
+  const keys = getConfiguredGeminiApiKeys();
+  if (keys.length <= 1) {
+    return { client: fallbackClient, keyId: keys[0] ?? 'default' };
+  }
+  const startIdx = keyRoundRobinCursor % keys.length;
+  keyRoundRobinCursor = (keyRoundRobinCursor + 1) % keys.length;
+
+  for (let offset = 0; offset < keys.length; offset++) {
+    const key = keys[(startIdx + offset) % keys.length];
+    const cooldownUntil = keyRateLimitCooldownUntil.get(key) ?? 0;
+    if (cooldownUntil <= now) {
+      return { client: buildGeminiClientForKey(key), keyId: key };
+    }
+  }
+  const fallbackKey = keys[startIdx];
+  return { client: buildGeminiClientForKey(fallbackKey), keyId: fallbackKey };
+}
 
 function getOrderedFreeTierModels(now = Date.now()): readonly string[] {
   const active: string[] = [];
@@ -216,11 +272,11 @@ function getOrderedFreeTierModels(now = Date.now()): readonly string[] {
 }
 
 /**
- * Resilient Gemini caller powered by `executeWithGeminiRetry` across configured models:
+ * Resilient Gemini caller powered by `executeWithGeminiRetry` across configured models and API keys:
  * - Forwards a per-attempt AbortSignal to `@google/genai` `config.abortSignal` (which passes it to `fetch`).
  * - Respects client disconnects via `parentSignal` (including aborting retry backoff sleep).
- * - Handles 429 hard quota exhaustion and 429 rate limits with per-model fallback across `FREE_TIER_MODELS`
- *   plus a 60s per-model 429 cooldown so multi-step pipelines immediately use `gemini-3.1-flash-lite`.
+ * - Automatically rotates across multiple configured API keys (`GEMINI_API_KEY`, `GEMINI_API_KEYS`, `GEMINI_API_KEY_2..5`)
+ *   and falls back across `FREE_TIER_MODELS` on 429 quota/rate limits.
  * - Automatically strips `thinkingConfig` on `gemini-3.1-flash-lite` fallback for compatibility.
  */
 async function generateWithFreeTierFallback(
@@ -230,16 +286,18 @@ async function generateWithFreeTierFallback(
   maxRounds = 2,
   options?: { parentSignal?: AbortSignal }
 ) {
+  const keyCount = Math.max(1, getConfiguredGeminiApiKeys().length);
   return executeWithGeminiRetry({
     models: getOrderedFreeTierModels(),
     timeoutMs: Math.max(10_000, Math.min(timeoutMs, 45_000)),
-    maxRounds,
+    maxRounds: Math.max(maxRounds, Math.min(4, keyCount + 1)),
     parentSignal: options?.parentSignal,
     invoke: async (model, attemptSignal) => {
       const adapted =
         model === 'gemini-3.1-flash-lite' ? stripThinkingConfig(params) : params;
+      const { client, keyId } = pickGeminiClientForAttempt(ai);
       try {
-        return await ai.models.generateContent({
+        return await client.models.generateContent({
           ...adapted,
           model,
           config: {
@@ -251,7 +309,10 @@ async function generateWithFreeTierFallback(
         const msg = err instanceof Error ? err.message : String(err ?? '');
         const status = Number((err as { status?: number; code?: number } | null)?.status ?? 0);
         if (status === 429 || /\b429\b|RESOURCE_EXHAUSTED|quota|rate limit/i.test(msg)) {
-          modelRateLimitCooldownUntil.set(model, Date.now() + 60_000);
+          keyRateLimitCooldownUntil.set(keyId, Date.now() + 60_000);
+          if (keyCount <= 1) {
+            modelRateLimitCooldownUntil.set(model, Date.now() + 60_000);
+          }
         }
         throw err;
       }
@@ -260,18 +321,12 @@ async function generateWithFreeTierFallback(
 }
 
 function createGeminiClient(): GoogleGenAI | null {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
+  const keys = getConfiguredGeminiApiKeys();
+  if (keys.length === 0) {
     return null;
   }
-  return new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
-  });
+  const { client } = pickGeminiClientForAttempt(buildGeminiClientForKey(keys[0]));
+  return client;
 }
 
 function getLanguageInstruction(language: LanguageCode): string {
@@ -509,12 +564,31 @@ async function fetchYouTubeBundle(
     if (watchHtmlResult.status === 'fulfilled' && watchHtmlResult.value) {
       const html = watchHtmlResult.value;
       if (!lengthSeconds) {
-        const lenMatch = html.match(/"lengthSeconds":"(\d+)"/);
+        const lenMatch =
+          html.match(/"lengthSeconds":"(\d+)"/) ??
+          html.match(/"approxDurationMs":"(\d+)"/);
         if (lenMatch?.[1]) {
-          const parsed = Number(lenMatch[1]);
+          const rawNum = Number(lenMatch[1]);
+          const parsed = lenMatch[0].includes('approxDurationMs')
+            ? Math.round(rawNum / 1000)
+            : rawNum;
           if (Number.isFinite(parsed) && parsed > 0) {
             lengthSeconds = parsed;
           }
+        }
+      }
+      if (!lengthSeconds) {
+        let maxEndMs = 0;
+        const endMsRegex = /"endTimeMs":"(\d+)"/g;
+        let endMatch: RegExpExecArray | null;
+        while ((endMatch = endMsRegex.exec(html)) !== null) {
+          const val = Number(endMatch[1]);
+          if (Number.isFinite(val) && val > maxEndMs && val <= 72 * 3600 * 1000) {
+            maxEndMs = val;
+          }
+        }
+        if (maxEndMs >= 10_000) {
+          lengthSeconds = Math.round(maxEndMs / 1000);
         }
       }
       if (!description || description.length < 250) {
@@ -526,10 +600,27 @@ async function fetchYouTubeBundle(
           }
         }
       }
+      if (!description || description.length < 250) {
+        const attrDescMatch = html.match(
+          /"attributedDescription":\{"content":"((?:\\.|[^"\\])*)"/
+        );
+        if (attrDescMatch?.[1]) {
+          const decoded = decodeJsonEscapedString(attrDescMatch[1]).trim();
+          if (decoded.length > (description?.length ?? 0)) {
+            description = decoded;
+          }
+        }
+      }
       if (!description) {
         const descMatch = html.match(/<meta\s+name="description"\s+content="([^"]*)"/i);
         if (descMatch?.[1]) {
           description = decodeHtmlEntities(descMatch[1]);
+        }
+      }
+      if (!title) {
+        const titleMeta = html.match(/<meta\s+name="title"\s+content="([^"]*)"/i);
+        if (titleMeta?.[1]) {
+          title = decodeHtmlEntities(titleMeta[1]);
         }
       }
       if (tracks.length === 0) {
@@ -545,11 +636,79 @@ async function fetchYouTubeBundle(
       officialChapters = extractChaptersFromYtInitialData(html, lengthSeconds);
     }
 
+    // Fallback: if duration or title is still unknown (e.g. datacenter LOGIN_REQUIRED without macro markers),
+    // query InnerTube WEB search endpoint for exact lengthText (e.g. "9:45:58") and title.
+    if (!lengthSeconds || !title) {
+      try {
+        const searchResp = await fetch(
+          'https://www.youtube.com/youtubei/v1/search?prettyPrint=false',
+          {
+            method: 'POST',
+            signal: controller.signal,
+            redirect: 'manual',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              query: videoId,
+              context: {
+                client: {
+                  clientName: 'WEB',
+                  clientVersion: '2.20250214.01.00',
+                },
+              },
+            }),
+          }
+        );
+        if (searchResp.ok) {
+          const searchRaw = await searchResp.text();
+          const marker = `"videoRenderer":{"videoId":"${videoId}"`;
+          const idx = searchRaw.indexOf(marker);
+          if (idx !== -1) {
+            const slice = searchRaw.slice(idx, idx + 4500);
+            if (!lengthSeconds) {
+              const lenTextMatch = slice.match(
+                /"lengthText":\{(?:[^{}]|\{[^{}]*\})*?"simpleText":"(\d{1,2}:\d{2}(?::\d{2})?)"/
+              );
+              if (lenTextMatch?.[1]) {
+                const parsedSec = parseTimestampToSeconds(lenTextMatch[1]);
+                if (parsedSec > 0) {
+                  lengthSeconds = parsedSec;
+                }
+              }
+            }
+            if (!title) {
+              const titleMatch = slice.match(
+                /"title":\{"runs":\[\{"text":"((?:\\.|[^"\\])*)"/
+              );
+              if (titleMatch?.[1]) {
+                title = decodeJsonEscapedString(titleMatch[1]).trim() || title;
+              }
+            }
+            if (!authorName) {
+              const ownerMatch = slice.match(
+                /"ownerText":\{"runs":\[\{"text":"((?:\\.|[^"\\])*)"/
+              );
+              if (ownerMatch?.[1]) {
+                authorName = decodeJsonEscapedString(ownerMatch[1]).trim() || authorName;
+              }
+            }
+          }
+        }
+      } catch {
+        // Non-fatal fallback
+      }
+    }
+
     const descriptionChapters = extractChaptersFromDescription(
       description ?? '',
       lengthSeconds
     );
     const chapters = mergeVideoChapters(officialChapters, descriptionChapters);
+    if (lengthSeconds && chapters.length > 0) {
+      const lastChapter = chapters[chapters.length - 1];
+      if (!lastChapter.endSeconds && lengthSeconds > lastChapter.startSeconds) {
+        lastChapter.endSeconds = lengthSeconds;
+      }
+    }
 
     const captionSegments =
       tracks.length > 0 ? await fetchCaptionSegments(tracks, controller.signal) : [];
@@ -825,6 +984,7 @@ function sanitizeWorkspace(
     oembed: OEmbedInfo;
     videoDurationSeconds?: number;
     coverageMode?: CoverageMode;
+    officialChapters?: VideoChapterMarker[];
   }
 ): LectureWorkspace {
   const maxDur =
@@ -1206,7 +1366,11 @@ function sanitizeWorkspace(
     transcript: sanitizedSections,
   };
 
-  return normalizeAndDeduplicateWorkspace(assembled);
+  const normalized = normalizeAndDeduplicateWorkspace(assembled);
+  return ensureFullTimelineCoverage(normalized, {
+    officialChapters: meta.officialChapters,
+    expectedDurationSeconds: resolvedDurationSeconds,
+  });
 }
 
 interface RawGroundingChunk {
@@ -1245,23 +1409,20 @@ async function startServer() {
   app.disable('x-powered-by');
   app.set('trust proxy', resolveTrustProxySetting(process.env));
 
-  const authStorePath =
-    process.env.MINDFLOW_AUTH_STORE_PATH?.trim() ||
-    path.resolve(process.cwd(), 'data', 'auth-store.json');
-  const authStore = new PersistentAuthStore(authStorePath);
-  await authStore.initialize();
-  const usagePolicy: UsagePolicy = {
+  // Fair-use limits for the shared server key (no login). Visitors who add their own free
+  // Gemini key (x-user-gemini-key) are never counted against these limits.
+  const usagePolicy = {
     analysisLimit: Math.min(
-      25,
-      Math.max(1, Number.parseInt(process.env.MINDFLOW_DAILY_ANALYSIS_LIMIT ?? '3', 10) || 3)
+      50,
+      Math.max(1, Number.parseInt(process.env.MINDFLOW_DAILY_ANALYSIS_LIMIT ?? '5', 10) || 5)
     ),
     aiActionLimit: Math.min(
-      200,
-      Math.max(1, Number.parseInt(process.env.MINDFLOW_DAILY_AI_ACTION_LIMIT ?? '20', 10) || 20)
+      500,
+      Math.max(1, Number.parseInt(process.env.MINDFLOW_DAILY_AI_ACTION_LIMIT ?? '40', 10) || 40)
     ),
     globalDailyLimit: Math.min(
-      10_000,
-      Math.max(1, Number.parseInt(process.env.MINDFLOW_AI_DAILY_GLOBAL_LIMIT ?? '50', 10) || 50)
+      100_000,
+      Math.max(1, Number.parseInt(process.env.MINDFLOW_AI_DAILY_GLOBAL_LIMIT ?? '150', 10) || 150)
     ),
   };
 
@@ -1293,45 +1454,26 @@ async function startServer() {
       return;
     }
     const requiredToken = process.env.MINDFLOW_API_ACCESS_TOKEN?.trim();
-    const isAuthBootstrapRoute = req.path.startsWith('/auth/');
-    if (requiredToken && !isAuthBootstrapRoute) {
-      const cookieHeader = typeof req.headers.cookie === 'string' ? req.headers.cookie : '';
-      const sessionCookie = cookieHeader
-        .split(';')
-        .map((part) => part.trim())
-        .find((part) => part.startsWith('mindflow_session='));
-      const sessionToken = sessionCookie?.slice('mindflow_session='.length) || null;
-      void authStore
-        .getUserForSession(sessionToken)
-        .then((user) => {
-          if (user) {
-            next();
-            return;
-          }
-          const headerToken =
-            req.headers['x-mindflow-token'] ?? req.headers['x-mindflow-access-token'];
-          const rawProvided =
-            typeof headerToken === 'string'
-              ? headerToken.trim()
-              : typeof req.headers.authorization === 'string' &&
-                  req.headers.authorization.startsWith('Bearer ')
-                ? req.headers.authorization.slice(7).trim()
-                : '';
-          const a = Buffer.from(rawProvided, 'utf8');
-          const b = Buffer.from(requiredToken, 'utf8');
-          const matches = a.length === b.length && timingSafeEqual(a, b);
-          if (!matches) {
-            res.status(401).json({
-              error: 'A valid MindFlow account session is required.',
-              code: 'AUTH_REQUIRED',
-              retryable: false,
-            });
-            return;
-          }
-          next();
-        })
-        .catch(next);
-      return;
+    if (requiredToken) {
+      const headerToken =
+        req.headers['x-mindflow-token'] ?? req.headers['x-mindflow-access-token'];
+      const rawProvided =
+        typeof headerToken === 'string'
+          ? headerToken.trim()
+          : typeof req.headers.authorization === 'string' &&
+              req.headers.authorization.startsWith('Bearer ')
+            ? req.headers.authorization.slice(7).trim()
+            : '';
+      const a = Buffer.from(rawProvided, 'utf8');
+      const b = Buffer.from(requiredToken, 'utf8');
+      if (!(a.length === b.length && timingSafeEqual(a, b))) {
+        res.status(401).json({
+          error: 'A valid access token is required.',
+          code: 'ACCESS_TOKEN_REQUIRED',
+          retryable: false,
+        });
+        return;
+      }
     }
     next();
   });
@@ -1356,28 +1498,28 @@ async function startServer() {
 
   // Bounded TTL caches + in-flight deduplicator to avoid redundant Gemini token spend
   const analyzeCache = new TtlLruCache<Record<string, unknown>>({
-    maxEntries: 40,
-    ttlMs: 20 * 60_000,
+    maxEntries: 60,
+    ttlMs: 60 * 60_000,
   });
   const translateCache = new TtlLruCache<Record<string, unknown>>({
-    maxEntries: 60,
-    ttlMs: 20 * 60_000,
+    maxEntries: 80,
+    ttlMs: 60 * 60_000,
   });
   const simplifyCache = new TtlLruCache<Record<string, unknown>>({
-    maxEntries: 120,
-    ttlMs: 30 * 60_000,
+    maxEntries: 160,
+    ttlMs: 60 * 60_000,
   });
   const groundingCache = new TtlLruCache<Record<string, unknown>>({
-    maxEntries: 120,
-    ttlMs: 30 * 60_000,
+    maxEntries: 160,
+    ttlMs: 60 * 60_000,
   });
   const visualGuideCache = new TtlLruCache<Record<string, unknown>>({
-    maxEntries: 30,
-    ttlMs: 20 * 60_000,
+    maxEntries: 40,
+    ttlMs: 60 * 60_000,
   });
   const chatCache = new TtlLruCache<Record<string, unknown>>({
-    maxEntries: 120,
-    ttlMs: 3 * 60_000,
+    maxEntries: 160,
+    ttlMs: 15 * 60_000,
   });
   const inFlight = new InFlightDeduplicator();
 
@@ -1422,193 +1564,88 @@ async function startServer() {
     };
   };
 
-  const signupLimiter = new SlidingWindowRateLimiter({ windowMs: 60 * 60_000, maxRequests: 5 });
-  const loginLimiter = new SlidingWindowRateLimiter({ windowMs: 15 * 60_000, maxRequests: 12 });
-  const withAuthAttemptLimit = (
-    limiter: SlidingWindowRateLimiter,
-    endpointName: string
-  ): express.RequestHandler => (req, res, next) => {
-    const decision = limiter.check(`${endpointName}:${getClientKey(req)}`);
-    res.setHeader('X-RateLimit-Limit', String(decision.limit));
-    res.setHeader('X-RateLimit-Remaining', String(decision.remaining));
-    if (!decision.allowed) {
-      res.setHeader('Retry-After', String(decision.resetAfterSeconds));
-      res.status(429).json({
-        error: `Too many ${endpointName} attempts. Please wait and try again.`,
-        code: 'AUTH_RATE_LIMITED',
-        retryAfterSeconds: decision.resetAfterSeconds,
-      });
+  /** Binds the visitor's own Gemini key (if any) to this request. Must run AFTER express.json(). */
+  const bindUserKey: express.RequestHandler = (req, _res, next) => {
+    const raw = req.headers['x-user-gemini-key'];
+    const key = typeof raw === 'string' ? raw.trim() : '';
+    if (key && /^[A-Za-z0-9_.-]{20,160}$/.test(key)) {
+      requestKeyStorage.run(key, () => next());
       return;
     }
     next();
   };
 
-  const sessionCookieName = 'mindflow_session';
-  const readSessionToken = (req: express.Request): string | null => {
-    const cookieHeader = req.headers.cookie;
-    if (typeof cookieHeader !== 'string') return null;
-    const cookie = cookieHeader
-      .split(';')
-      .map((part) => part.trim())
-      .find((part) => part.startsWith(`${sessionCookieName}=`));
-    return cookie ? cookie.slice(sessionCookieName.length + 1) || null : null;
-  };
-  const writeSessionCookie = (res: express.Response, token: string) => {
-    const secure = isProduction ? '; Secure' : '';
-    res.setHeader(
-      'Set-Cookie',
-      `${sessionCookieName}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${14 * 24 * 60 * 60}${secure}`
-    );
-  };
-  const clearSessionCookie = (res: express.Response) => {
-    const secure = isProduction ? '; Secure' : '';
-    res.setHeader(
-      'Set-Cookie',
-      `${sessionCookieName}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure}`
-    );
-  };
-  const requireAuth: express.RequestHandler = (req, res, next) => {
-    void authStore
-      .getUserForSession(readSessionToken(req))
-      .then((user) => {
-        if (!user) {
-          res.status(401).json({
-            error: 'Sign in to use video analysis and AI study tools.',
-            code: 'AUTH_REQUIRED',
-            retryable: false,
-          });
-          return;
-        }
-        res.locals.mindflowUser = user;
-        next();
-      })
-      .catch(next);
-  };
-
-  const sendAuthError = (res: express.Response, error: unknown) => {
-    if (error instanceof AuthStoreError) {
-      const status = error.code === 'EMAIL_TAKEN' ? 409 : error.code === 'ACCOUNT_LIMIT' ? 503 : 400;
-      res.status(status).json({ error: error.message, code: error.code });
-      return;
+  // In-memory daily counters (reset at UTC midnight or server restart). No accounts, no cookies.
+  const usageDay = { key: '', global: 0, perClient: new Map<string, { analyses: number; ai: number }>() };
+  const rollUsageDay = () => {
+    const today = new Date().toISOString().slice(0, 10);
+    if (usageDay.key !== today) {
+      usageDay.key = today;
+      usageDay.global = 0;
+      usageDay.perClient.clear();
     }
-    res.status(400).json({
-      error: error instanceof Error ? error.message : 'Could not complete account request.',
-      code: 'INVALID_AUTH_INPUT',
-    });
   };
-
-  app.post(
-    '/api/auth/signup',
-    withAuthAttemptLimit(signupLimiter, 'signup'),
-    express.json({ limit: '16kb' }),
-    async (req, res) => {
-      try {
-        const user = await authStore.register(req.body?.email, req.body?.password);
-        const session = await authStore.createSession(user.id);
-        writeSessionCookie(res, session.token);
-        res.setHeader('Cache-Control', 'no-store');
-        res.status(201).json({
-          user,
-          usage: await authStore.getUsage(user.id, usagePolicy),
-        });
-      } catch (error) {
-        sendAuthError(res, error);
-      }
-    }
-  );
-
-  app.post(
-    '/api/auth/login',
-    withAuthAttemptLimit(loginLimiter, 'login'),
-    express.json({ limit: '16kb' }),
-    async (req, res) => {
-      try {
-        const user = await authStore.authenticate(req.body?.email, req.body?.password);
-        if (!user) {
-          res.status(401).json({
-            error: 'Email or password is incorrect.',
-            code: 'INVALID_CREDENTIALS',
-          });
-          return;
-        }
-        const session = await authStore.createSession(user.id);
-        writeSessionCookie(res, session.token);
-        res.setHeader('Cache-Control', 'no-store');
-        res.json({ user, usage: await authStore.getUsage(user.id, usagePolicy) });
-      } catch (error) {
-        sendAuthError(res, error);
-      }
-    }
-  );
-
-  app.get('/api/auth/me', (req, res) => {
-    res.setHeader('Cache-Control', 'no-store');
-    void authStore
-      .getUserForSession(readSessionToken(req))
-      .then(async (user) => {
-        res.json({
-          user,
-          usage: user ? await authStore.getUsage(user.id, usagePolicy) : null,
-        });
-      })
-      .catch(() => res.status(500).json({ error: 'Could not load account status.' }));
-  });
-
-  app.post('/api/auth/logout', express.json({ limit: '2kb' }), async (req, res) => {
-    try {
-      await authStore.destroySession(readSessionToken(req));
-      clearSessionCookie(res);
-      res.setHeader('Cache-Control', 'no-store');
-      res.json({ ok: true });
-    } catch {
-      res.status(500).json({ error: 'Could not sign out right now.' });
-    }
-  });
+  const attachCurrentUsageHeaders = async (
+    _req: express.Request,
+    _res: express.Response
+  ): Promise<void> => {
+    // Cached results are free; nothing to attach.
+  };
 
   const enforceAiUsage = async (
     req: express.Request,
     res: express.Response,
     kind: 'analysis' | 'ai'
   ): Promise<boolean> => {
-    const user = res.locals.mindflowUser as AuthUser | undefined;
-    if (!user) {
-      res.status(401).json({ error: 'Sign in to continue.', code: 'AUTH_REQUIRED' });
-      return false;
-    }
-    try {
-      const decision = await authStore.consumeUsage(user.id, kind, usagePolicy);
-      if (decision.allowed) {
-        res.setHeader(
-          'X-MindFlow-AI-Actions-Remaining',
-          String(Math.max(0, decision.usage.aiActionLimit - decision.usage.aiActionsUsed))
-        );
-        return true;
-      }
-      const resetAt = Date.parse(decision.usage.resetsAt);
-      const retryAfterSeconds = Math.max(1, Math.ceil((resetAt - Date.now()) / 1000));
+    if (requestKeyStorage.getStore()) return true; // visitor's own key: not counted
+    rollUsageDay();
+    const clientKey = getClientKey(req);
+    const entry = usageDay.perClient.get(clientKey) ?? { analyses: 0, ai: 0 };
+    let reason: 'analysis_limit' | 'user_daily_limit' | 'global_daily_limit' | null = null;
+    if (usageDay.global >= usagePolicy.globalDailyLimit) reason = 'global_daily_limit';
+    else if (kind === 'analysis' && entry.analyses >= usagePolicy.analysisLimit) reason = 'analysis_limit';
+    else if (entry.ai >= usagePolicy.aiActionLimit) reason = 'user_daily_limit';
+
+    if (reason) {
+      const nextMidnight = new Date();
+      nextMidnight.setUTCHours(24, 0, 0, 0);
+      const retryAfterSeconds = Math.max(1, Math.ceil((nextMidnight.getTime() - Date.now()) / 1000));
       const messages = {
-        analysis_limit: `Daily video analysis limit reached (${decision.usage.analysisLimit}). Try again after the daily reset.`,
-        user_daily_limit: `Daily AI study limit reached (${decision.usage.aiActionLimit} requests). Try again after the daily reset.`,
-        global_daily_limit: 'MindFlow has reached its shared AI budget for today. Please try again after the daily reset.',
+        analysis_limit: `Free video-analysis limit reached (${usagePolicy.analysisLimit}/day). Add your own free Gemini API key for unlimited use, or try again after the daily reset.`,
+        user_daily_limit: `Free AI limit reached (${usagePolicy.aiActionLimit} requests/day). Add your own free Gemini API key to keep going, or try again after the daily reset.`,
+        global_daily_limit:
+          'The shared free budget for today is used up. Add your own free Gemini API key to continue, or try again after the daily reset.',
       };
       res.setHeader('Retry-After', String(retryAfterSeconds));
       res.status(429).json({
-        error: decision.reason ? messages[decision.reason] : 'Daily AI limit reached.',
-        code:
-          decision.reason === 'analysis_limit'
-            ? 'ANALYSIS_DAILY_LIMIT'
-            : decision.reason === 'global_daily_limit'
-              ? 'GLOBAL_DAILY_LIMIT'
-              : 'USER_DAILY_LIMIT',
+        error: messages[reason],
+        code: reason === 'global_daily_limit' ? 'GLOBAL_DAILY_LIMIT' : reason === 'analysis_limit' ? 'ANALYSIS_DAILY_LIMIT' : 'USER_DAILY_LIMIT',
         retryAfterSeconds,
-        usage: decision.usage,
+        retryable: false,
+        canUseOwnKey: true,
       });
       return false;
-    } catch (error) {
-      console.error(`[MindFlow Auth Error] ${sanitizeLogString(error)}`);
-      res.status(503).json({ error: 'Could not verify daily usage right now.', code: 'AUTH_STORE_UNAVAILABLE' });
-      return false;
     }
+    entry.ai += 1;
+    if (kind === 'analysis') entry.analyses += 1;
+    usageDay.perClient.set(clientKey, entry);
+    usageDay.global += 1;
+    return true;
+  };
+
+  const refundAiUsage = async (
+    req: express.Request,
+    _res: express.Response,
+    kind: 'analysis' | 'ai'
+  ): Promise<void> => {
+    if (requestKeyStorage.getStore()) return;
+    rollUsageDay();
+    const entry = usageDay.perClient.get(getClientKey(req));
+    if (entry) {
+      entry.ai = Math.max(0, entry.ai - 1);
+      if (kind === 'analysis') entry.analyses = Math.max(0, entry.analyses - 1);
+    }
+    usageDay.global = Math.max(0, usageDay.global - 1);
   };
 
   const acquireAiSlot = (
@@ -1657,9 +1694,9 @@ async function startServer() {
    */
   app.post(
     '/api/analyze',
-    requireAuth,
     withRateLimit(rateLimiters.analyze, 'analyze'),
     express.json({ limit: '2mb' }),
+    bindUserKey,
     async (req, res) => {
       const {
         videoId,
@@ -1710,7 +1747,7 @@ async function startServer() {
       if (!ai) {
         res.status(503).json({
           error:
-            'GEMINI_API_KEY is not configured in Settings > Secrets. Add a free Gemini API key to analyze any YouTube video.',
+            'No Gemini key is configured on the server. Tap the key icon and add your own free Gemini API key (aistudio.google.com/apikey) to analyze any YouTube video.',
           code: 'AI_NOT_CONFIGURED',
           retryable: false,
           canPasteTranscript: true,
@@ -1724,6 +1761,7 @@ async function startServer() {
       }`;
       const cached = analyzeCache.get(cacheKey);
       if (cached) {
+        await attachCurrentUsageHeaders(req, res);
         res.setHeader('X-MindFlow-Cache', 'HIT');
         res.json(cached);
         return;
@@ -1732,7 +1770,10 @@ async function startServer() {
       if (!(await enforceAiUsage(req, res, 'analysis'))) return;
 
       const releaseSlot = acquireAiSlot(req, res);
-      if (!releaseSlot) return;
+      if (!releaseSlot) {
+        await refundAiUsage(req, res, 'analysis');
+        return;
+      }
 
       const { controller: clientAbort, cleanup: cleanupAbort } =
         createClientAbortController(res);
@@ -1943,7 +1984,7 @@ ${getDomainCheatSheetGuidance(contentDomain)}
               responseMimeType: 'application/json',
               responseSchema: WORKSPACE_RESPONSE_SCHEMA,
               maxOutputTokens: scaleProfile.maxOutputTokens,
-              thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM },
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
             },
           },
           scaleProfile.timeoutMs,
@@ -2004,11 +2045,26 @@ ${getDomainCheatSheetGuidance(contentDomain)}
         }
 
         // Layer 4 Path (Safe Long-Video & No-Captions Fallback):
-        // Official YouTube Chapters + Full Description + Google Search Grounding
+        // Official YouTube Chapters + Full Description (+ Google Search Grounding only when chapter/description metadata is sparse)
         if (!parsed) {
           analysisMode = 'search-grounded';
           coverageMode = 'chapters-metadata';
-          const researchPrompt = `Research the exact YouTube video "${mergedOembed.title ?? safeVideoId}" by "${mergedOembed.authorName ?? 'YouTube Creator'}" (${normalizedUrl}, exact duration: ${totalDurationFormatted}) using Google Search.
+          const hasRichChapterMetadata =
+            ytBundle.chapters.length >= 4 && (ytBundle.description?.length ?? 0) >= 200;
+
+          let groundedNotes = '';
+          if (hasRichChapterMetadata) {
+            groundedNotes = [
+              `Title: ${mergedOembed.title ?? safeVideoId}`,
+              `Channel: ${mergedOembed.authorName ?? 'YouTube Creator'}`,
+              `Total Duration: ${totalDurationFormatted} (${totalDurationSeconds}s)`,
+              chaptersBlock,
+              ytBundle.description ? `Full Video Description:\n${ytBundle.description}` : '',
+            ]
+              .filter(Boolean)
+              .join('\n\n');
+          } else {
+            const researchPrompt = `Research the exact YouTube video "${mergedOembed.title ?? safeVideoId}" by "${mergedOembed.authorName ?? 'YouTube Creator'}" (${normalizedUrl}, exact duration: ${totalDurationFormatted}) using Google Search.
 ${chaptersBlock}
 ${ytBundle.description ? `Video description:\n${ytBundle.description.slice(0, 6000)}\n` : ''}
 Provide accurate, end-to-end educational study notes covering the ENTIRE ${totalDurationFormatted} runtime (from introduction through middle concepts to final conclusions). Do NOT invent facts not verifiable from the video or search results:
@@ -2016,26 +2072,26 @@ Provide accurate, end-to-end educational study notes covering the ENTIRE ${total
 2. Complete chronological outline of ${scaleProfile.mainNodesMin}–${scaleProfile.mainNodesMax} major modules across 0%–100% of the runtime (using exact H:MM:SS timestamps from official chapters when available), with ${scaleProfile.subNodesMin}–${scaleProfile.subNodesMax} concrete subtopics per module
 3. Accurate definitions, rules/formulas/steps, comparisons/trade-offs, common mistakes, and real-world examples covered across early, middle, and final sections.`;
 
-          let groundedNotes = '';
-          try {
-            const searchResp = await generateWithFreeTierFallback(
-              ai,
-              {
-                contents: researchPrompt,
-                config: {
-                  tools: [{ googleSearch: {} }],
+            try {
+              const searchResp = await generateWithFreeTierFallback(
+                ai,
+                {
+                  contents: researchPrompt,
+                  config: {
+                    tools: [{ googleSearch: {} }],
+                  },
                 },
-              },
-              18000,
-              2,
-              { parentSignal: sharedSignal }
-            );
-            groundedNotes = (searchResp.text ?? '').trim();
-          } catch (searchErr) {
-            if (sharedSignal.aborted) {
-              throw sharedSignal.reason ?? searchErr;
+                18000,
+                2,
+                { parentSignal: sharedSignal }
+              );
+              groundedNotes = (searchResp.text ?? '').trim();
+            } catch (searchErr) {
+              if (sharedSignal.aborted) {
+                throw sharedSignal.reason ?? searchErr;
+              }
+              groundedNotes = ytBundle.description || mergedOembed.title || normalizedUrl;
             }
-            groundedNotes = ytBundle.description || mergedOembed.title || normalizedUrl;
           }
 
           repairSourceContext = groundedNotes.slice(0, 24000);
@@ -2047,7 +2103,7 @@ Provide accurate, end-to-end educational study notes covering the ENTIRE ${total
                 responseMimeType: 'application/json',
                 responseSchema: WORKSPACE_RESPONSE_SCHEMA,
                 maxOutputTokens: scaleProfile.maxOutputTokens,
-                thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM },
+                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
               },
             },
             scaleProfile.timeoutMs,
@@ -2075,6 +2131,7 @@ Provide accurate, end-to-end educational study notes covering the ENTIRE ${total
         oembed: mergedOembed,
         videoDurationSeconds: totalDurationSeconds > 0 ? totalDurationSeconds : undefined,
         coverageMode,
+        officialChapters: ytBundle.chapters,
       };
 
       let workspace: LectureWorkspace = sanitizeWorkspace(parsed, sanitizeOptions);
@@ -2085,8 +2142,8 @@ Provide accurate, end-to-end educational study notes covering the ENTIRE ${total
         minChapters: Math.max(3, Math.floor(scaleProfile.scriptChaptersMin * 0.7)),
       });
 
-      // Automated 1-pass coverage & quality repair if critical gaps remain (e.g., missing late/middle chapters)
-      if (qualityReport.needsAiRepair && repairSourceContext) {
+      // Automated 1-pass coverage & quality repair only if critical gaps remain after deterministic timeline coverage
+      if (qualityReport.needsAiRepair && qualityReport.score < 68 && repairSourceContext) {
         try {
           const issuesSummary = qualityReport.issues
             .map((iss) => `- [${iss.severity.toUpperCase()}] ${iss.message}`)
@@ -2114,7 +2171,7 @@ ${repairSourceContext.slice(0, 75000)}`;
                 responseMimeType: 'application/json',
                 responseSchema: WORKSPACE_RESPONSE_SCHEMA,
                 maxOutputTokens: scaleProfile.maxOutputTokens,
-                thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM },
+                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
               },
             },
             26000,
@@ -2161,6 +2218,7 @@ ${repairSourceContext.slice(0, 75000)}`;
         res.setHeader('X-MindFlow-Cache', 'MISS');
         res.json(result);
       } catch (error) {
+        await refundAiUsage(req, res, 'analysis');
         if (error instanceof Error && error.message === 'YOUTUBE_VIDEO_UNAVAILABLE') {
           const reason = (error as Error & { userReason?: string }).userReason;
           if (!res.headersSent && !res.writableEnded) {
@@ -2195,9 +2253,9 @@ ${repairSourceContext.slice(0, 75000)}`;
    */
   app.post(
     '/api/translate',
-    requireAuth,
     withRateLimit(rateLimiters.translate, 'translate'),
     express.json({ limit: '1mb' }),
+    bindUserKey,
     async (req, res) => {
       const { workspace, targetLanguage } = (req.body ?? {}) as {
         workspace?: Record<string, unknown>;
@@ -2364,9 +2422,9 @@ ${JSON.stringify(workspace)}`;
    */
   app.post(
     '/api/simplify',
-    requireAuth,
     withRateLimit(rateLimiters.simplify, 'simplify'),
     express.json({ limit: '128kb' }),
+    bindUserKey,
     async (req, res) => {
       const {
         nodeTitle,
@@ -2523,9 +2581,9 @@ Never invent technical claims that contradict the video notes.`;
    */
   app.post(
     '/api/grounding/node',
-    requireAuth,
     withRateLimit(rateLimiters.grounding, 'grounding'),
     express.json({ limit: '128kb' }),
+    bindUserKey,
     async (req, res) => {
       const { nodeTitle, lectureTitle, keyPoints } = req.body ?? {};
       const cleanNodeTitle = sanitizeUserText(nodeTitle, 240);
@@ -2903,9 +2961,9 @@ Never invent technical claims that contradict the video notes.`;
    */
   app.post(
     '/api/generate-visual-guide',
-    requireAuth,
     withRateLimit(rateLimiters.visualGuide, 'visual-guide'),
     express.json({ limit: '1mb' }),
+    bindUserKey,
     async (req, res) => {
       const {
         videoId,
@@ -3021,7 +3079,7 @@ ${diagramPromptRule}
                   responseMimeType: 'application/json',
                   responseSchema: VISUAL_GUIDE_RESPONSE_SCHEMA,
                   maxOutputTokens: 16384,
-                  thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM },
+                  thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
                 },
               },
               36000,
@@ -3186,9 +3244,9 @@ ${diagramPromptRule}
    */
   app.post(
     '/api/chat',
-    requireAuth,
     withRateLimit(rateLimiters.chat, 'chat'),
     express.json({ limit: '512kb' }),
+    bindUserKey,
     async (req, res) => {
       const {
         question,

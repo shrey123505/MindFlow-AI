@@ -7,6 +7,7 @@ export type DurationScaleTier = 'short' | 'medium' | 'long' | 'mega';
 export interface VideoChapterMarker {
   title: string;
   startSeconds: number;
+  endSeconds?: number;
   timestampLabel: string;
 }
 
@@ -158,6 +159,7 @@ export function extractChaptersFromDescription(
 
     const cleanedTitle = line
       .replace(match[0], ' ')
+      .replace(/^[\s\-–—:|•·.)\]]*(?:\d{1,2}:\d{2}(?::\d{2})?)[\s\-–—:|•·.)\]]*/, ' ')
       .replace(/^[\s\-–—:|•·.)\]]+/, '')
       .replace(/[\s\-–—:|•·(\[]+$/, '')
       .replace(/\s+/g, ' ')

@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AlertCircle, CheckCircle2, Info } from 'lucide-react';
+import { AlertCircle, BrainCircuit, CheckCircle2, Info, Loader2 } from 'lucide-react';
 import { SAMPLE_DSA_BY_LANGUAGE, SAMPLE_DSA_LECTURE } from './data/sampleLecture';
 import { SAMPLE_VISUAL_GUIDES_BY_LANGUAGE } from './data/sampleVisualGuide';
 import type {
@@ -50,9 +50,8 @@ import {
   MobileNodeDrawer,
 } from './components/MobileShell';
 import { VideoChatWidget } from './components/VideoChatWidget';
-import { AuthModal } from './components/AuthModal';
-import { apiFetch } from './utils/apiFetch';
-import type { AccountUsage, AccountUser, AuthSessionResponse } from './types/auth';
+import { ApiKeyModal } from './components/ApiKeyModal';
+import { apiFetch, getStoredGeminiKey } from './utils/apiFetch';
 
 // Code-split heavy modals & PDF generation dependencies out of the initial bundle
 const ExportModal = lazy(() =>
@@ -157,9 +156,9 @@ const ANALYSIS_STEPS = [
 export default function App() {
   const isDesktop = useIsDesktop();
 
-  const [accountUser, setAccountUser] = useState<AccountUser | null>(null);
-  const [accountUsage, setAccountUsage] = useState<AccountUsage | null>(null);
-  const [accountOpen, setAccountOpen] = useState(false);
+  const [apiKeyOpen, setApiKeyOpen] = useState(false);
+  const [quotaLimitHit, setQuotaLimitHit] = useState(false);
+  const [hasOwnKey, setHasOwnKey] = useState(() => Boolean(getStoredGeminiKey()));
 
   const [language, setLanguage] = useState<LanguageCode>('en');
   const [workspace, setWorkspace] = useState<LectureWorkspace>(SAMPLE_DSA_LECTURE);
@@ -185,8 +184,9 @@ export default function App() {
   const [simplifyError, setSimplifyError] = useState<string | null>(null);
 
   // Mobile-specific state
-  const [mobileUrlOpen, setMobileUrlOpen] = useState(false);
+  const [mobileUrlOpen, setMobileUrlOpen] = useState(true);
   const [mobilePlayerMinimized, setMobilePlayerMinimized] = useState(false);
+  const [mobileTakeawaysCollapsed, setMobileTakeawaysCollapsed] = useState(true);
   const [mobileDrawerOpen, setMobileDrawerOpen] = useState(false);
 
   // Modals, drawers, docked chat & desktop split-panel sizing
@@ -289,47 +289,22 @@ export default function App() {
     []
   );
 
-  const refreshAccount = useCallback(async () => {
-    try {
-      const response = await fetch('/api/auth/me', { credentials: 'same-origin' });
-      const data = (await response.json().catch(() => null)) as AuthSessionResponse | null;
-      if (!response.ok || !data) return;
-      setAccountUser(data.user ?? null);
-      setAccountUsage(data.usage ?? null);
-    } catch {
-      // Account status is optional for the built-in demo and will retry on the next API action.
-    }
-  }, []);
-
   useEffect(() => {
-    void refreshAccount();
-    const onAuthRequired = () => setAccountOpen(true);
-    const onUsageUpdated = () => void refreshAccount();
-    window.addEventListener('mindflow:auth-required', onAuthRequired);
-    window.addEventListener('mindflow:usage-updated', onUsageUpdated);
-    return () => {
-      window.removeEventListener('mindflow:auth-required', onAuthRequired);
-      window.removeEventListener('mindflow:usage-updated', onUsageUpdated);
+    const onQuotaLimit = () => {
+      setQuotaLimitHit(true);
+      setApiKeyOpen(true);
     };
-  }, [refreshAccount]);
-
-  const handleAuthenticated = useCallback(
-    (session: AuthSessionResponse) => {
-      setAccountUser(session.user ?? null);
-      setAccountUsage(session.usage ?? null);
-      setAccountOpen(false);
-      showToast('Signed in. Your study tools are ready.');
-    },
-    [showToast]
-  );
-
-  const handleSignedOut = useCallback(() => {
-    setAccountUser(null);
-    setAccountUsage(null);
-    setAccountOpen(false);
-    setChatOpen(false);
-    showToast('You have been signed out.', 'info');
-  }, [showToast]);
+    const onKeyChanged = () => {
+      setHasOwnKey(Boolean(getStoredGeminiKey()));
+      setQuotaLimitHit(false);
+    };
+    window.addEventListener('mindflow:quota-limit', onQuotaLimit);
+    window.addEventListener('mindflow:key-changed', onKeyChanged);
+    return () => {
+      window.removeEventListener('mindflow:quota-limit', onQuotaLimit);
+      window.removeEventListener('mindflow:key-changed', onKeyChanged);
+    };
+  }, []);
 
   // Inform user if corrupted library data was recovered on startup
   useEffect(() => {
@@ -912,7 +887,7 @@ export default function App() {
     ]
   );
 
-  // Restore shared deep-link parameters (?v=...&t=...&lang=...) once on initial mount
+  // Restore shared deep-link parameters (?v=...&t=...&lang=...) once on startup
   const initializedShareRef = useRef(false);
   useEffect(() => {
     if (initializedShareRef.current || typeof window === 'undefined') return;
@@ -1208,8 +1183,7 @@ export default function App() {
           isTranslating={isTranslating}
           libraryCount={libraryItems.length}
           chatOpen={chatOpen}
-          accountUser={accountUser}
-          accountUsage={accountUsage}
+          hasOwnKey={hasOwnKey}
           onUrlChange={(val) => {
             setUrlInput(val);
             if (urlError) {
@@ -1230,7 +1204,7 @@ export default function App() {
           onOpenLibrary={() => setLibraryOpen(true)}
           onOpenManualTranscript={() => setManualTranscriptOpen(true)}
           onToggleChat={() => setChatOpen((prev) => !prev)}
-          onOpenAccount={() => setAccountOpen(true)}
+          onOpenApiKey={() => setApiKeyOpen(true)}
         />
 
         {/* Mobile Top Header */}
@@ -1243,8 +1217,7 @@ export default function App() {
           isAnalyzing={isAnalyzing}
           isTranslating={isTranslating}
           libraryCount={libraryItems.length}
-          accountUser={accountUser}
-          accountUsage={accountUsage}
+          hasOwnKey={hasOwnKey}
           onToggleUrlBar={() => setMobileUrlOpen((prev) => !prev)}
           onUrlChange={(val) => {
             setUrlInput(val);
@@ -1261,17 +1234,16 @@ export default function App() {
           onUrlSubmit={() => runAnalysis()}
           onLanguageChange={handleLanguageChange}
           onOpenLibrary={() => setLibraryOpen(true)}
-          onOpenAccount={() => setAccountOpen(true)}
+          onOpenApiKey={() => setApiKeyOpen(true)}
           onOpenManualTranscript={() => setManualTranscriptOpen(true)}
+          onShareLink={handleShareLink}
         />
 
-        <AuthModal
-          open={accountOpen}
-          user={accountUser}
-          usage={accountUsage}
-          onClose={() => setAccountOpen(false)}
-          onAuthenticated={handleAuthenticated}
-          onSignedOut={handleSignedOut}
+        <ApiKeyModal
+          open={apiKeyOpen}
+          limitReached={quotaLimitHit}
+          onClose={() => setApiKeyOpen(false)}
+          onNotify={showToast}
         />
 
         {/* ==================== DESKTOP SPLIT-SCREEN WORKSPACE (lg+) ==================== */}
@@ -1409,6 +1381,7 @@ export default function App() {
                 mode="docked"
                 workspace={workspace}
                 language={language}
+                onOpenApiKey={() => setApiKeyOpen(true)}
                 onClose={() => setChatOpen(false)}
                 onJumpToTimestamp={(sec) => jumpVideoTo(sec)}
               />
@@ -1422,7 +1395,7 @@ export default function App() {
               <YouTubePlayerCard
                 videoId={workspace.videoId}
                 title={workspace.title}
-                channel={workspace.channel}
+                channel={`${workspace.channel} · ${workspace.videoCategory}`}
                 seekRequest={seekRequest}
                 activeTimestampLabel={activeTimestampLabel}
                 isDemo={isDemo}
@@ -1431,6 +1404,29 @@ export default function App() {
                 onToggleMinimize={() => setMobilePlayerMinimized((prev) => !prev)}
               />
             </div>
+
+            {/* Mobile Key Takeaways & Node Inspector Card (full parity with PC version) */}
+            <KeyTakeawaysCard
+              node={selectedNode}
+              language={language}
+              isTranslating={isTranslating}
+              collapsed={mobileTakeawaysCollapsed}
+              isSimplified={isCurrentNodeSimplified}
+              simplifiedText={currentSimplifiedText}
+              simplifiedStructured={currentSimplifiedStructured}
+              simplifyLoading={simplifyLoading}
+              simplifyError={simplifyError}
+              isGenerating={isAnalyzing}
+              groundingInsight={currentGroundingInsight}
+              groundingLoading={groundingLoading}
+              groundingError={groundingError}
+              onLanguageChange={handleLanguageChange}
+              onToggleCollapse={() => setMobileTakeawaysCollapsed((prev) => !prev)}
+              onToggleSimplify={handleToggleSimplify}
+              onJumpToTimestamp={(sec) => jumpVideoTo(sec)}
+              onGenerateMindmap={() => runAnalysis()}
+              onFetchWebInsights={handleFetchWebInsights}
+            />
 
             {/* Mobile Main Active Tab Content */}
             <div className="flex-1 min-h-0">
@@ -1518,6 +1514,7 @@ export default function App() {
             mode="mobile-sheet"
             workspace={workspace}
             language={language}
+            onOpenApiKey={() => setApiKeyOpen(true)}
             onClose={() => setChatOpen(false)}
             onJumpToTimestamp={(sec) => jumpVideoTo(sec)}
           />
@@ -1589,7 +1586,7 @@ export default function App() {
         )}
 
         <footer className="relative z-10 mt-auto px-4 pb-2 pt-1 text-center text-[11px] font-medium tracking-wide text-slate-500">
-          Built by Shrey <span className="mx-1.5 text-slate-700">·</span> MindFlow AI
+          Built by Shrey Prajapati <span className="mx-1.5 text-slate-700">·</span> MindFlow AI
         </footer>
       </div>
 

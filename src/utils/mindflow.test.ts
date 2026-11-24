@@ -85,6 +85,7 @@ import {
 import {
   compressPlainTextStratified,
   detectContentDomain,
+  ensureFullTimelineCoverage,
   formatStructuredSimplification,
   getAdaptiveScaleProfile,
   normalizeAndDeduplicateWorkspace,
@@ -1209,6 +1210,101 @@ test('parseStructuredSimplification, adaptSvgDiagramToTheme, sanitizeOptionalSvg
   ];
   const matched = filterTranscriptSections(customSections, 'UniqueAmortizedDoublingSignalPhrase');
   assert.equal(matched.length, 1);
+});
+
+test('ensureFullTimelineCoverage expands truncated 15-minute output across 0%–100% of a 9h45m (35158s) course', () => {
+  const description = [
+    '00:00:00 - 00:07:22 — Intro',
+    '00:07:23 - 00:34:39 — What is DAX',
+    '01:28:18 - 02:13:55 — Aggregation Functions',
+    '03:39:11 - 04:08:52 — Filter Functions',
+    '05:45:03 - 06:53:46 — Evaluation Contexts & CALCULATE',
+    '06:53:47 - 07:45:23 — Time Intelligence Functions',
+    '08:30:11 - 09:45:58 — Project & Final End-to-End Dashboard',
+  ].join('\n');
+
+  const officialChapters = extractChaptersFromDescription(description, 35158);
+  assert.equal(officialChapters.length, 7);
+  assert.equal(officialChapters[0].title, 'Intro');
+  assert.equal(officialChapters[6].title, 'Project & Final End-to-End Dashboard');
+
+  // Simulate an AI response that stopped after the first 25 minutes with only 1 transcript chapter
+  const truncated: LectureWorkspace = {
+    ...SAMPLE_DSA_LECTURE,
+    title: 'Complete DAX Tutorial for Beginners to Advanced | Power BI Full Course',
+    videoDurationSeconds: 35158,
+    durationLabel: '9:45:58',
+    nodes: [
+      {
+        ...SAMPLE_DSA_LECTURE.nodes[0],
+        id: 'root',
+        isRoot: true,
+        timestampSeconds: 0,
+        timestampLabel: '00:00',
+      },
+      {
+        ...SAMPLE_DSA_LECTURE.nodes[1],
+        id: 'node-1',
+        title: 'Intro & What is DAX',
+        timestampSeconds: 0,
+        timestampLabel: '00:00',
+        subNodes: [
+          {
+            ...SAMPLE_DSA_LECTURE.nodes[1].subNodes![0],
+            id: 'node-1-sub-1',
+            parentId: 'node-1',
+            title: 'Calculated Columns vs Measures',
+            timestampSeconds: 443,
+            timestampLabel: '07:23',
+          },
+        ],
+      },
+    ],
+    transcript: [
+      {
+        id: 'chapter-1',
+        nodeId: 'node-1',
+        title: 'Intro to DAX',
+        topicTag: 'Module 1',
+        startLabel: '00:00',
+        startSeconds: 0,
+        endLabel: '25:00',
+        endSeconds: 1500,
+        accent: 'violet',
+        lines: [
+          {
+            id: 'l-1',
+            timestampLabel: '00:00',
+            timestampSeconds: 0,
+            text: 'Introduction to DAX formulas in Power BI.',
+          },
+        ],
+      },
+    ],
+  };
+
+  const completed = ensureFullTimelineCoverage(truncated, {
+    officialChapters,
+    expectedDurationSeconds: 35158,
+  });
+
+  const mainModules = completed.nodes.filter((n) => !n.isRoot);
+  assert.ok(mainModules.length >= 6);
+  assert.ok(mainModules.every((m) => (m.subNodes?.length ?? 0) >= 2));
+  assert.ok(completed.transcript.length >= 7);
+  const highestTranscriptEnd = Math.max(
+    ...completed.transcript.map((s) => s.endSeconds ?? s.startSeconds)
+  );
+  assert.ok(highestTranscriptEnd >= Math.floor(35158 * 0.85));
+
+  const report = validateWorkspaceQuality(completed, {
+    expectedDurationSeconds: 35158,
+    officialChapters,
+    minModules: 6,
+    minChapters: 7,
+  });
+  assert.equal(report.isAcceptable, true);
+  assert.ok(report.score >= 80);
 });
 
 

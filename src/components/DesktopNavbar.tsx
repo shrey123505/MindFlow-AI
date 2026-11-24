@@ -6,17 +6,15 @@ import {
   FolderClock,
   Link2,
   Loader2,
-  LogIn,
   MessageCircle,
   Network,
   ScrollText,
   Share2,
   Sparkles,
   X,
-  UserRound,
+  KeyRound,
 } from 'lucide-react';
 import type { ActiveTab, LanguageCode } from '../types/mindflow';
-import type { AccountUsage, AccountUser } from '../types/auth';
 import { LanguageSwitcher } from './LanguageSwitcher';
 
 interface DesktopNavbarProps {
@@ -29,8 +27,7 @@ interface DesktopNavbarProps {
   isTranslating: boolean;
   libraryCount: number;
   chatOpen: boolean;
-  accountUser: AccountUser | null;
-  accountUsage: AccountUsage | null;
+  hasOwnKey: boolean;
   onUrlChange: (value: string) => void;
   onUrlClear: () => void;
   onUrlSubmit: () => void;
@@ -41,7 +38,7 @@ interface DesktopNavbarProps {
   onOpenLibrary: () => void;
   onOpenManualTranscript: () => void;
   onToggleChat: () => void;
-  onOpenAccount: () => void;
+  onOpenApiKey: () => void;
 }
 
 const TABS: Array<{ id: ActiveTab; label: string; icon: typeof Network }> = [
@@ -60,8 +57,7 @@ export function DesktopNavbar({
   isTranslating,
   libraryCount,
   chatOpen,
-  accountUser,
-  accountUsage,
+  hasOwnKey,
   onUrlChange,
   onUrlClear,
   onUrlSubmit,
@@ -72,7 +68,7 @@ export function DesktopNavbar({
   onOpenLibrary,
   onOpenManualTranscript,
   onToggleChat,
-  onOpenAccount,
+  onOpenApiKey,
 }: DesktopNavbarProps) {
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
@@ -227,26 +223,14 @@ export function DesktopNavbar({
 
           <button
             type="button"
-            data-testid="desktop-account-btn"
-            onClick={onOpenAccount}
-            aria-label={accountUser ? `Account for ${accountUser.email}` : 'Sign in or create an account'}
-            title={
-              accountUser
-                ? `${accountUser.email}${accountUsage ? ` · ${accountUsage.analysesUsed}/${accountUsage.analysisLimit} video analyses today` : ''}`
-                : 'Sign in or create an account'
-            }
-            className="inline-flex items-center gap-1.5 rounded-full bg-white/[0.05] hover:bg-white/[0.1] px-2.5 py-1.5 min-h-[36px] text-xs font-semibold text-slate-200 border border-white/[0.1] transition-colors duration-150 whitespace-nowrap shrink-0 cursor-pointer"
+            data-testid="desktop-apikey-btn"
+            onClick={onOpenApiKey}
+            aria-label="Use your own Gemini API key"
+            title="Use your own free Gemini key (no daily cap from this site)"
+            className="inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 min-h-[36px] text-xs font-semibold border bg-white/[0.06] hover:bg-white/[0.11] text-slate-100 border-white/[0.12] transition-colors duration-150 whitespace-nowrap shrink-0 cursor-pointer"
           >
-            {accountUser ? (
-              <UserRound className="h-4 w-4 text-cyan-300" aria-hidden="true" />
-            ) : (
-              <LogIn className="h-4 w-4 text-cyan-300" aria-hidden="true" />
-            )}
-            <span className="hidden 2xl:inline">
-              {accountUser
-                ? `${accountUsage?.analysesUsed ?? 0}/${accountUsage?.analysisLimit ?? 3} today`
-                : 'Sign in'}
-            </span>
+            <KeyRound className={`h-3.5 w-3.5 shrink-0 ${hasOwnKey ? 'text-emerald-400' : 'text-cyan-300'}`} aria-hidden="true" />
+            <span className="hidden xl:inline">{hasOwnKey ? 'My key' : 'Own key'}</span>
           </button>
 
           <button

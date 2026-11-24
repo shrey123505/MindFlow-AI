@@ -49,18 +49,17 @@ Optional environment variables supported by `server.ts` (see `.env.example`):
 - `ALLOWED_ORIGINS`: Comma-separated list of additional allowed browser origins for `POST /api/*` requests (same-origin and loopback requests are allowed automatically).
 - `AI_HOURLY_IP_LIMIT`: Per-IP hourly AI request budget across all AI routes (default `120`).
 - `MINDFLOW_API_ACCESS_TOKEN`: Optional shared access token checked via `x-mindflow-token` or `Authorization: Bearer <token>` on `/api/*` endpoints (useful for private beta protection).
-- `MINDFLOW_AUTH_STORE_PATH`: Path to the private account/session/usage JSON store. Defaults to `./data/auth-store.json`; place this on a persistent private disk in production. This file contains password hashes and session-token hashes.
-- `MINDFLOW_DAILY_ANALYSIS_LIMIT`: Uncached video analyses allowed per account per UTC day (default `3`).
-- `MINDFLOW_DAILY_AI_ACTION_LIMIT`: Uncached AI actions allowed per account per UTC day (default `20`).
-- `MINDFLOW_AI_DAILY_GLOBAL_LIMIT`: Uncached AI actions allowed across the whole site per UTC day (default `50`), to cap shared-key usage even if many accounts sign up.
+- `MINDFLOW_DAILY_ANALYSIS_LIMIT`: Free video analyses per visitor (per IP) per UTC day on the shared server key (default `5`).
+- `MINDFLOW_DAILY_AI_ACTION_LIMIT`: Free AI actions per visitor per UTC day (default `40`).
+- `MINDFLOW_AI_DAILY_GLOBAL_LIMIT`: Free AI actions across the whole site per UTC day (default `150`) — protects your Gemini quota.
 
-### Accounts and AI quotas
+### No login, fair-use quota, bring-your-own-key
 
-Video analysis, translation, concept simplification, search grounding, visual-guide generation, and Ask AI require an account session. Passwords are stored as salted scrypt hashes, sessions use random opaque tokens in `HttpOnly`, `SameSite=Lax` cookies, and account/session data stays on the server. Signup/login attempts are rate-limited. Cached AI results do not consume daily usage. Each admitted uncached request uses one AI action; video analyses also use one video-analysis slot. A request that fails after it starts can still count.
+There are no accounts or sessions. Anyone can paste a YouTube link and use every feature immediately.
 
-Every account uses the Gemini key configured for this site. Per-account caps and the site-wide daily cap bound shared usage; they do not provide separate billing per user or guarantee the provider's exact quota. Set `MINDFLOW_AI_DAILY_GLOBAL_LIMIT` below your expected daily allowance before sharing the site.
+To stop other people from draining *your* Gemini key, the server counts free AI usage per visitor and site-wide (in memory, reset at UTC midnight or on restart). When the free limit is reached, the app shows a dialog where the visitor can paste **their own free Gemini API key** (from aistudio.google.com/apikey). That key is stored only in their browser and sent with their requests (`x-user-gemini-key`); it is used for that request only, never stored or logged on the server, and their usage is never counted against your limits.
 
-The built-in account store is designed for one server process on a host with persistent private disk. It does not send email-verification or password-reset messages, and it is not suitable for multiple replicas sharing an ephemeral filesystem. Before running multiple server instances or requiring verified email ownership, move accounts and quota counters to a shared database/auth provider. Keep the Gemini key in server environment secrets and serve production over HTTPS.
+Cached results (same video + language) are free and do not count.
 
 ## Testing & Quality Checks
 

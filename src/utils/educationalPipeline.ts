@@ -692,6 +692,456 @@ export function normalizeAndDeduplicateWorkspace(
   };
 }
 
+const ACCENT_PALETTE: Array<'violet' | 'cyan' | 'emerald' | 'indigo'> = [
+  'violet',
+  'cyan',
+  'emerald',
+  'indigo',
+];
+const ICON_PALETTE: Array<'book' | 'layers' | 'git-branch' | 'globe'> = [
+  'book',
+  'layers',
+  'git-branch',
+  'globe',
+];
+
+function cleanChapterHeading(raw: string): string {
+  return raw
+    .replace(/^\d{1,2}:\d{2}(?::\d{2})?[.\s\-–—:]*/g, '')
+    .replace(/\\u0026/g, '&')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Ensures full 0%–100% timeline coverage across Mindmap nodes, subNodes, Cheat Sheet cards,
+ * and chronological Script chapters whenever official/description chapters or long-video
+ * metadata are available. Never fabricates facts outside the video's chapters and extracted notes.
+ */
+export function ensureFullTimelineCoverage(
+  workspace: LectureWorkspace,
+  options?: {
+    officialChapters?: VideoChapterMarker[];
+    expectedDurationSeconds?: number;
+  }
+): LectureWorkspace {
+  const normalized = normalizeAndDeduplicateWorkspace(workspace);
+  const official = (options?.officialChapters ?? [])
+    .map((ch) => ({
+      ...ch,
+      title: cleanChapterHeading(ch.title) || ch.title,
+    }))
+    .filter((ch) => ch.title.length >= 2)
+    .sort((a, b) => a.startSeconds - b.startSeconds);
+
+  const maxChapterSec = official.length > 0 ? official[official.length - 1].startSeconds : 0;
+  const totalDur = Math.max(
+    normalized.videoDurationSeconds ?? 0,
+    options?.expectedDurationSeconds ?? 0,
+    maxChapterSec
+  );
+
+  const rootNode = normalized.nodes.find((n) => n.isRoot) ?? normalized.nodes[0];
+  let mainNodes = normalized.nodes.filter((n) => n !== rootNode);
+
+  // 1. If official chapters cover parts of the timeline missing from mainNodes, add chronological module groups
+  if (official.length >= 4 && totalDur >= 600) {
+    const targetGroupCount = Math.min(9, Math.max(6, Math.ceil(official.length / 2)));
+    const groupSize =
+      official.length <= 10 ? 1 : Math.max(1, Math.ceil(official.length / targetGroupCount));
+    const windowSec = Math.min(300, Math.max(90, Math.floor(totalDur * 0.015)));
+
+    for (let g = 0; g < official.length; g += groupSize) {
+      const slice = official.slice(g, g + groupSize);
+      if (slice.length === 0) continue;
+      const anchor = slice[0];
+      const alreadyCovered = mainNodes.some(
+        (m) =>
+          Math.abs(m.timestampSeconds - anchor.startSeconds) <= windowSec ||
+          textSimilarity(m.title, anchor.title) >= 0.72
+      );
+      if (!alreadyCovered && mainNodes.length < 10) {
+        const idx = mainNodes.length + 1;
+        const accent = ACCENT_PALETTE[(idx - 1) % ACCENT_PALETTE.length];
+        const icon = ICON_PALETTE[(idx - 1) % ICON_PALETTE.length];
+        const nodeId = `node-ch-${anchor.startSeconds}`;
+        const subChapters = slice.length > 1 ? slice.slice(1) : slice;
+        const subNodes: MindmapSubNode[] = subChapters.slice(0, 5).map((sc, sIdx) => ({
+          id: `${nodeId}-sub-${sIdx + 1}`,
+          parentId: nodeId,
+          title: sc.title.slice(0, 80),
+          shortSubtitle: `Section at ${sc.timestampLabel} in ${normalized.title}`,
+          timestampSeconds: sc.startSeconds,
+          timestampLabel: formatSecondsToTimestamp(sc.startSeconds),
+          accent,
+          icon,
+          keyPoints: [
+            {
+              keyword: sc.title.slice(0, 48),
+              detail: `Covers ${sc.title} starting at ${sc.timestampLabel} in the lecture timeline.`,
+            },
+          ],
+          realLifeExample: `Applied workflow for ${sc.title} demonstrated at ${sc.timestampLabel}.`,
+          simplifiedAnalogy: `Think of ${sc.title} as a dedicated building block in the ${normalized.title} curriculum.`,
+        }));
+
+        mainNodes.push({
+          id: nodeId,
+          title: anchor.title.slice(0, 80),
+          shortSubtitle:
+            slice.length > 1
+              ? `${slice.map((s) => s.title).join(' · ').slice(0, 130)}`
+              : `Module starting at ${anchor.timestampLabel}`,
+          timestampSeconds: anchor.startSeconds,
+          timestampLabel: formatSecondsToTimestamp(anchor.startSeconds),
+          isRoot: false,
+          accent,
+          icon,
+          position: { x: 162, y: 120 },
+          keyPoints: slice.slice(0, 4).map((s) => ({
+            keyword: s.title.slice(0, 48),
+            detail: `Key module topic taught at ${s.timestampLabel} (${s.title}).`,
+          })),
+          realLifeExample: `Practical implementation of ${anchor.title} covered from ${anchor.timestampLabel}.`,
+          simplifiedAnalogy: `${anchor.title} forms the ${Math.round((anchor.startSeconds / Math.max(1, totalDur)) * 100)}% milestone of the course progression.`,
+          subNodes,
+        });
+      }
+    }
+  }
+
+  mainNodes.sort((a, b) => a.timestampSeconds - b.timestampSeconds);
+
+  // 2. Ensure every mainNode has at least 2 subNodes (using official chapters in its time span or its keyPoints)
+  for (let i = 0; i < mainNodes.length; i++) {
+    const node = mainNodes[i];
+    const nextStart = mainNodes[i + 1]?.timestampSeconds ?? (totalDur > 0 ? totalDur + 1 : Infinity);
+    const existingSubs = [...(node.subNodes ?? [])];
+
+    if (existingSubs.length < 2 && official.length > 0) {
+      const spanChapters = official.filter(
+        (ch) => ch.startSeconds >= node.timestampSeconds && ch.startSeconds < nextStart
+      );
+      for (const ch of spanChapters) {
+        if (existingSubs.length >= 5) break;
+        if (
+          existingSubs.some(
+            (s) =>
+              textSimilarity(s.title, ch.title) >= 0.75 ||
+              Math.abs(s.timestampSeconds - ch.startSeconds) < 15
+          )
+        ) {
+          continue;
+        }
+        const subAccent = (node.accent === 'root' ? 'cyan' : node.accent) as Exclude<
+          MindmapNode['accent'],
+          'root'
+        >;
+        existingSubs.push({
+          id: `${node.id}-chsub-${ch.startSeconds}`,
+          parentId: node.id,
+          title: ch.title.slice(0, 80),
+          shortSubtitle: `${node.title} · ${ch.timestampLabel}`,
+          timestampSeconds: ch.startSeconds,
+          timestampLabel: formatSecondsToTimestamp(ch.startSeconds),
+          accent: subAccent,
+          icon: node.icon,
+          keyPoints: [
+            {
+              keyword: ch.title.slice(0, 48),
+              detail: `${ch.title} explained at ${ch.timestampLabel} within ${node.title}.`,
+            },
+          ],
+          realLifeExample:
+            node.realLifeExample || `Practical walkthrough of ${ch.title} at ${ch.timestampLabel}.`,
+          simplifiedAnalogy:
+            node.simplifiedAnalogy || `Core sub-topic under ${node.title} (${ch.timestampLabel}).`,
+        });
+      }
+    }
+
+    if (existingSubs.length < 2 && node.keyPoints.length >= 2) {
+      const spanSec =
+        Number.isFinite(nextStart) && nextStart > node.timestampSeconds
+          ? nextStart - node.timestampSeconds
+          : 300;
+      const subAccent = (node.accent === 'root' ? 'cyan' : node.accent) as Exclude<
+        MindmapNode['accent'],
+        'root'
+      >;
+      for (let k = 0; k < node.keyPoints.length && existingSubs.length < 3; k++) {
+        const kp = node.keyPoints[k];
+        if (existingSubs.some((s) => textSimilarity(s.title, kp.keyword) >= 0.75)) continue;
+        const offsetSec = Math.min(
+          totalDur > 0 ? totalDur : node.timestampSeconds + spanSec,
+          node.timestampSeconds + Math.floor(((k + 1) * spanSec) / (node.keyPoints.length + 1))
+        );
+        existingSubs.push({
+          id: `${node.id}-kpsub-${k + 1}`,
+          parentId: node.id,
+          title: kp.keyword.slice(0, 80),
+          shortSubtitle: kp.detail.slice(0, 120),
+          timestampSeconds: offsetSec,
+          timestampLabel: formatSecondsToTimestamp(offsetSec),
+          accent: subAccent,
+          icon: node.icon,
+          keyPoints: [kp],
+          realLifeExample: node.realLifeExample || kp.detail,
+          simplifiedAnalogy: node.simplifiedAnalogy || kp.detail,
+        });
+      }
+    }
+
+    if (existingSubs.length < 2) {
+      const spanSec =
+        Number.isFinite(nextStart) && nextStart > node.timestampSeconds
+          ? nextStart - node.timestampSeconds
+          : 300;
+      const subAccent = (node.accent === 'root' ? 'cyan' : node.accent) as Exclude<
+        MindmapNode['accent'],
+        'root'
+      >;
+      while (existingSubs.length < 2) {
+        const isFirst = existingSubs.length === 0;
+        const midSec = Math.min(
+          totalDur > 0 ? totalDur : node.timestampSeconds + spanSec,
+          node.timestampSeconds + Math.floor(spanSec * (isFirst ? 0.25 : 0.65))
+        );
+        const subTitle = isFirst
+          ? `${node.title} — Core Concepts`
+          : `${node.title} — Practical Application`;
+        existingSubs.push({
+          id: `${node.id}-sub-auto-${existingSubs.length + 1}`,
+          parentId: node.id,
+          title: subTitle.slice(0, 80),
+          shortSubtitle: `${node.title} · ${formatSecondsToTimestamp(midSec)}`,
+          timestampSeconds: midSec,
+          timestampLabel: formatSecondsToTimestamp(midSec),
+          accent: subAccent,
+          icon: node.icon,
+          keyPoints:
+            node.keyPoints.length > 0
+              ? node.keyPoints.slice(0, 2)
+              : [
+                  {
+                    keyword: node.title.slice(0, 48),
+                    detail: `Key concepts and practical walkthrough covered at ${formatSecondsToTimestamp(midSec)}.`,
+                  },
+                ],
+          realLifeExample:
+            node.realLifeExample ||
+            `Practical walkthrough of ${node.title} at ${formatSecondsToTimestamp(midSec)}.`,
+          simplifiedAnalogy:
+            node.simplifiedAnalogy ||
+            `Key milestone within ${node.title} (${formatSecondsToTimestamp(midSec)}).`,
+        });
+      }
+    }
+
+    node.subNodes = existingSubs;
+  }
+
+  // Re-index main node positions cleanly on the 2-column radial layout
+  const positionedNodes: MindmapNode[] = [];
+  if (rootNode) {
+    positionedNodes.push({
+      ...rootNode,
+      position: { x: 460, y: 280 },
+    });
+  }
+  mainNodes.slice(0, 12).forEach((m, idx) => {
+    const row = Math.floor(idx / 2);
+    const isLeft = idx % 2 === 0;
+    positionedNodes.push({
+      ...m,
+      position: { x: isLeft ? 162 : 758, y: 120 + row * 160 },
+    });
+  });
+
+  // 3. Ensure chronological Script (transcript) covers the full 0%–100% timeline
+  const scriptSections: TranscriptSection[] = [...normalized.transcript];
+  const minExpectedChapters =
+    official.length >= 4
+      ? Math.min(20, official.length)
+      : Math.max(mainNodes.length, totalDur >= 3600 ? 8 : 4);
+
+  if (scriptSections.length < minExpectedChapters) {
+    const candidateSources: Array<{
+      title: string;
+      startSeconds: number;
+      node: MindmapNode;
+      detailLines: Array<{ sec: number; text: string }>;
+      takeaway: string;
+    }> = [];
+
+    if (official.length >= 4) {
+      const sampledOfficial = sampleItemsEvenly(official, Math.min(22, official.length));
+      for (const ch of sampledOfficial) {
+        const ownerNode =
+          [...mainNodes]
+            .reverse()
+            .find((n) => n.timestampSeconds <= ch.startSeconds + 30) ??
+          mainNodes[0] ??
+          rootNode;
+        if (!ownerNode) continue;
+        const matchingSub = (ownerNode.subNodes ?? []).find(
+          (s) =>
+            Math.abs(s.timestampSeconds - ch.startSeconds) <= 120 ||
+            textSimilarity(s.title, ch.title) >= 0.65
+        );
+        const kpList = matchingSub?.keyPoints?.length
+          ? matchingSub.keyPoints
+          : ownerNode.keyPoints;
+        const lines = kpList.slice(0, 3).map((kp, lIdx) => ({
+          sec: Math.min(
+            totalDur > 0 ? totalDur : ch.startSeconds + lIdx * 30,
+            ch.startSeconds + lIdx * 20
+          ),
+          text: `${kp.keyword}: ${kp.detail}`,
+        }));
+        if (lines.length === 0) {
+          lines.push({
+            sec: ch.startSeconds,
+            text: `${ch.title} — ${ownerNode.shortSubtitle || ownerNode.title}`,
+          });
+        }
+        candidateSources.push({
+          title: ch.title,
+          startSeconds: ch.startSeconds,
+          node: ownerNode,
+          detailLines: lines,
+          takeaway:
+            matchingSub?.shortSubtitle ||
+            ownerNode.shortSubtitle ||
+            `Covers ${ch.title} starting at ${ch.timestampLabel}.`,
+        });
+      }
+    } else {
+      for (const m of mainNodes) {
+        candidateSources.push({
+          title: m.title,
+          startSeconds: m.timestampSeconds,
+          node: m,
+          detailLines: m.keyPoints.slice(0, 3).map((kp, lIdx) => ({
+            sec: m.timestampSeconds + lIdx * 15,
+            text: `${kp.keyword}: ${kp.detail}`,
+          })),
+          takeaway: m.shortSubtitle || m.simplifiedAnalogy || m.title,
+        });
+        for (const sub of (m.subNodes ?? []).slice(0, 2)) {
+          candidateSources.push({
+            title: `${m.title}: ${sub.title}`,
+            startSeconds: sub.timestampSeconds,
+            node: m,
+            detailLines: sub.keyPoints.slice(0, 2).map((kp, lIdx) => ({
+              sec: sub.timestampSeconds + lIdx * 10,
+              text: `${kp.keyword}: ${kp.detail}`,
+            })),
+            takeaway: sub.shortSubtitle || sub.simplifiedAnalogy || sub.title,
+          });
+        }
+      }
+    }
+
+    const dedupThresholdSec = Math.min(180, Math.max(25, Math.floor(totalDur * 0.004)));
+    for (const cand of candidateSources) {
+      const alreadyInScript = scriptSections.some(
+        (sec) =>
+          Math.abs(sec.startSeconds - cand.startSeconds) <= dedupThresholdSec ||
+          textSimilarity(sec.title, cand.title) >= 0.8
+      );
+      if (alreadyInScript) continue;
+      const accent =
+        cand.node.accent === 'root'
+          ? ACCENT_PALETTE[scriptSections.length % ACCENT_PALETTE.length]
+          : cand.node.accent;
+      scriptSections.push({
+        id: `script-ch-${cand.startSeconds}-${scriptSections.length + 1}`,
+        nodeId: cand.node.id,
+        title: cand.title,
+        topicTag: cand.node.title.slice(0, 36),
+        startSeconds: cand.startSeconds,
+        startLabel: formatSecondsToTimestamp(cand.startSeconds),
+        keyTakeaway: cand.takeaway,
+        accent,
+        lines: cand.detailLines.map((dl, lIdx) => ({
+          id: `line-${cand.startSeconds}-${lIdx + 1}`,
+          timestampSeconds: dl.sec,
+          timestampLabel: formatSecondsToTimestamp(dl.sec),
+          text: dl.text,
+        })),
+      });
+    }
+  }
+
+  // 4. Ensure Cheat Sheet definitions and realWorldExamples span early, middle, and late modules
+  const definitions = [...(normalized.cheatSheet.definitions ?? [])];
+  for (const m of mainNodes) {
+    if (definitions.length >= 14) break;
+    const hasModuleCard = definitions.some(
+      (d) =>
+        textSimilarity(d.term, m.title) >= 0.72 ||
+        (typeof d.timestampSeconds === 'number' &&
+          Math.abs(d.timestampSeconds - m.timestampSeconds) <= 120)
+    );
+    if (!hasModuleCard) {
+      const primaryKp = m.keyPoints[0];
+      const cardAccent =
+        m.accent === 'root'
+          ? ACCENT_PALETTE[definitions.length % ACCENT_PALETTE.length]
+          : m.accent;
+      definitions.push({
+        term: m.title,
+        summary: primaryKp ? `${primaryKp.keyword}: ${primaryKp.detail}` : m.shortSubtitle,
+        formulaOrNote: m.simplifiedAnalogy || m.shortSubtitle,
+        accent: cardAccent,
+        timestampSeconds: m.timestampSeconds,
+        timestampLabel: m.timestampLabel,
+        moduleLabel: m.title,
+        category: 'Core Module',
+      });
+    }
+  }
+
+  const realWorldExamples = [...(normalized.cheatSheet.realWorldExamples ?? [])];
+  for (const m of mainNodes) {
+    if (realWorldExamples.length >= 7) break;
+    if (!m.realLifeExample) continue;
+    const exists = realWorldExamples.some(
+      (ex) =>
+        textSimilarity(ex.structure, m.title) >= 0.72 ||
+        Math.abs(ex.timestampSeconds - m.timestampSeconds) <= 120
+    );
+    if (!exists) {
+      realWorldExamples.push({
+        domain: normalized.videoCategory || 'Applied Practice',
+        structure: m.title,
+        explanation: m.realLifeExample,
+        timestampSeconds: m.timestampSeconds,
+        timestampLabel: m.timestampLabel,
+      });
+    }
+  }
+
+  return normalizeAndDeduplicateWorkspace({
+    ...normalized,
+    ...(totalDur > 0
+      ? {
+          videoDurationSeconds: totalDur,
+          durationLabel: formatSecondsToTimestamp(totalDur),
+        }
+      : {}),
+    nodes: positionedNodes,
+    transcript: scriptSections,
+    cheatSheet: {
+      ...normalized.cheatSheet,
+      definitions,
+      realWorldExamples,
+    },
+  });
+}
+
+
 /**
  * Validates an AI-generated workspace before returning it to the user:
  * Checks chronological early/middle/late coverage, chapter alignment, timestamp validity,

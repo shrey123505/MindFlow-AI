@@ -34,6 +34,7 @@ interface VideoChatWidgetProps {
   mode: 'docked' | 'mobile-sheet';
   workspace: LectureWorkspace;
   language: LanguageCode;
+  onOpenApiKey?: () => void;
   onClose: () => void;
   onJumpToTimestamp: (seconds: number) => void;
 }
@@ -61,6 +62,7 @@ export function VideoChatWidget({
   mode,
   workspace,
   language,
+  onOpenApiKey,
   onClose,
   onJumpToTimestamp,
 }: VideoChatWidgetProps) {
@@ -352,9 +354,11 @@ export function VideoChatWidget({
             <Sparkles className="w-4 h-4 text-cyan-300" aria-hidden="true" />
           </span>
           <div className="min-w-0">
-            <h2 className="font-display text-sm font-bold text-white leading-tight">
-              Ask This Video
-            </h2>
+            <div className="flex items-center gap-2">
+              <h2 className="font-display text-sm font-bold text-white leading-tight">
+                Ask This Video
+              </h2>
+            </div>
             <p className="text-xs text-slate-400 truncate mt-0.5">
               {workspace.title} · {LANG_LABEL[language]}
             </p>
@@ -362,6 +366,15 @@ export function VideoChatWidget({
         </div>
 
         <div className="flex items-center gap-1.5 shrink-0">
+          {onOpenApiKey && (
+            <button
+              type="button"
+              onClick={onOpenApiKey}
+              className="rounded-lg border border-cyan-400/35 bg-cyan-500/12 px-2.5 py-1 text-[11px] font-semibold text-cyan-200 hover:bg-cyan-500/20 cursor-pointer"
+            >
+              Own key
+            </button>
+          )}
           {messages.length > 0 && !isSending && (
             <button
               type="button"
