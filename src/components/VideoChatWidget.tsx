@@ -17,6 +17,7 @@ import type {
 } from '../types/mindflow';
 import { buildDynamicChatPrompts } from '../utils/youtube';
 import { compactWorkspaceForChat } from '../utils/serverGuards';
+import { apiFetch } from '../utils/apiFetch';
 import {
   appendChatMessageToStore,
   clearVideoChatFromStore,
@@ -45,6 +46,16 @@ const LANG_LABEL: Record<LanguageCode, string> = {
 
 const CHAT_REQUEST_TIMEOUT_MS = 45_000;
 
+type AiServiceStatus =
+  | 'checking'
+  | 'configured'
+  | 'not_configured'
+  | 'in_progress'
+  | 'quota_exhausted'
+  | 'rate_limited'
+  | 'temporarily_unavailable'
+  | 'request_failed';
+
 export function VideoChatWidget({
   open,
   mode,
@@ -56,7 +67,8 @@ export function VideoChatWidget({
   const [input, setInput] = useState('');
   const [isSending, setIsSending] = useState(false);
   const [isRetrying, setIsRetrying] = useState(false);
-  const [aiConfigured, setAiConfigured] = useState<boolean | null>(null);
+  const [aiStatus, setAiStatus] = useState<AiServiceStatus>('checking');
+  const [aiStatusDetail, setAiStatusDetail] = useState<string | null>(null);
   const [chatStore, setChatStore] = useState<PersistedChatStore>(() =>
     loadChatStoreFromStorage()
   );
@@ -82,14 +94,33 @@ export function VideoChatWidget({
     if (!open) return;
     let isMounted = true;
     fetch('/api/health')
-      .then((r) => r.json())
-      .then((data: { aiConfigured?: boolean }) => {
-        if (isMounted && typeof data?.aiConfigured === 'boolean') {
-          setAiConfigured(data.aiConfigured);
+      .then(async (r) => {
+        if (!r.ok) {
+          throw new Error(`HTTP ${r.status}`);
+        }
+        return (await r.json()) as { aiConfigured?: boolean };
+      })
+      .then((data) => {
+        if (!isMounted || typeof data?.aiConfigured !== 'boolean') return;
+        setAiStatus((prev) => {
+          if (!data.aiConfigured) return 'not_configured';
+          if (prev === 'checking' || prev === 'not_configured' || prev === 'temporarily_unavailable') {
+            return 'configured';
+          }
+          return prev;
+        });
+        if (!data.aiConfigured) {
+          setAiStatusDetail(
+            'GEMINI_API_KEY is not set on the server. Set your API key in the environment to ask questions about this video.'
+          );
         }
       })
       .catch(() => {
-        // network or server down; leave as null
+        if (!isMounted) return;
+        setAiStatus('temporarily_unavailable');
+        setAiStatusDetail(
+          'Unable to reach the MindFlow AI backend right now. Check your connection or try again shortly.'
+        );
       });
     return () => {
       isMounted = false;
@@ -170,6 +201,8 @@ export function VideoChatWidget({
     }
 
     setIsSending(true);
+    setAiStatus('in_progress');
+    setAiStatusDetail(null);
 
     activeAbortRef.current?.abort();
     const controller = new AbortController();
@@ -179,7 +212,7 @@ export function VideoChatWidget({
     }, CHAT_REQUEST_TIMEOUT_MS);
 
     try {
-      const response = await fetch('/api/chat', {
+      const response = await apiFetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
@@ -212,13 +245,50 @@ export function VideoChatWidget({
         response.ok && typeof data?.answer === 'string' && data.answer.trim().length > 0;
 
       const fallbackErrorText =
-        response.status === 429
-          ? data?.error || 'AI quota is temporarily busy. Please wait a few seconds and click Retry.'
-          : response.status === 503 && data?.code === 'AI_AUTH_ERROR'
-            ? 'AI service is not configured on the server. Please set GEMINI_API_KEY in server environment settings.'
-            : response.status === 503 || response.status === 504
-              ? data?.error || 'The AI service is temporarily busy. Click Retry to try again.'
-              : data?.error || 'Could not answer right now. Please click Retry.';
+        data?.code === 'AI_QUOTA_EXHAUSTED'
+          ? data.error ||
+            'AI API quota is exhausted for this key. Please check your billing or quota settings and try again later.'
+          : response.status === 429
+            ? data?.error ||
+              (typeof data?.retryAfterSeconds === 'number'
+                ? `Rate limit reached. Please wait about ${data.retryAfterSeconds}s and click Retry.`
+                : 'AI rate limit reached. Please wait a few seconds and click Retry.')
+            : response.status === 503 &&
+                (data?.code === 'AI_AUTH_ERROR' || data?.code === 'AI_NOT_CONFIGURED')
+              ? 'AI service is not configured on the server. Please set GEMINI_API_KEY in server environment settings.'
+              : response.status === 503 || response.status === 504
+                ? data?.error || 'The AI service is temporarily unavailable. Click Retry to try again.'
+                : data?.error || 'Could not answer right now. Please click Retry.';
+
+      if (succeeded) {
+        setAiStatus('configured');
+        setAiStatusDetail(null);
+      } else if (data?.code === 'AI_AUTH_ERROR' || data?.code === 'AI_NOT_CONFIGURED') {
+        setAiStatus('not_configured');
+        setAiStatusDetail(fallbackErrorText);
+      } else if (data?.code === 'AI_QUOTA_EXHAUSTED') {
+        setAiStatus('quota_exhausted');
+        setAiStatusDetail(fallbackErrorText);
+      } else if (
+        response.status === 429 ||
+        data?.code === 'AI_RATE_LIMITED' ||
+        data?.code === 'RATE_LIMITED' ||
+        data?.code === 'AI_HOURLY_BUDGET_EXCEEDED'
+      ) {
+        setAiStatus('rate_limited');
+        setAiStatusDetail(fallbackErrorText);
+      } else if (
+        response.status === 503 ||
+        response.status === 504 ||
+        data?.code === 'AI_OVERLOADED' ||
+        data?.code === 'SERVER_BUSY'
+      ) {
+        setAiStatus('temporarily_unavailable');
+        setAiStatusDetail(fallbackErrorText);
+      } else {
+        setAiStatus('request_failed');
+        setAiStatusDetail(fallbackErrorText);
+      }
 
       const assistantMsg: VideoChatMessage = {
         id: `a-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
@@ -233,17 +303,21 @@ export function VideoChatWidget({
     } catch (err) {
       // Ignore silent aborts caused by switching videos/unmounting
       if (controller.signal.aborted && controller.signal.reason !== 'timeout') {
+        setAiStatus((prev) => (prev === 'in_progress' ? 'configured' : prev));
         return;
       }
       const isTimeout =
         controller.signal.reason === 'timeout' ||
         (err instanceof Error && err.name === 'AbortError');
+      const failureMessage = isTimeout
+        ? 'The AI tutor took too long to respond. Click Retry to try again.'
+        : 'Network error reaching video Q&A. Check your connection and click Retry.';
+      setAiStatus(isTimeout ? 'request_failed' : 'temporarily_unavailable');
+      setAiStatusDetail(failureMessage);
       const errMsg: VideoChatMessage = {
         id: `e-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         role: 'assistant',
-        content: isTimeout
-          ? 'The AI tutor took too long to respond. Click Retry to try again.'
-          : 'Network error reaching video Q&A. Check your connection and click Retry.',
+        content: failureMessage,
         createdAt: Date.now(),
         isError: true,
         failedQuestion: question,
@@ -329,7 +403,7 @@ export function VideoChatWidget({
         ref={scrollRef}
         className="flex-1 overflow-y-auto glass-scroll px-4 py-3.5 space-y-3.5"
       >
-        {aiConfigured === false && (
+        {aiStatus === 'not_configured' && (
           <div
             data-testid="ai-not-configured-banner"
             className="flex items-start gap-2.5 rounded-xl bg-amber-500/12 border border-amber-400/30 p-3 text-xs text-amber-200"
@@ -338,11 +412,38 @@ export function VideoChatWidget({
             <div>
               <p className="font-semibold text-amber-100">AI Service Not Configured</p>
               <p className="mt-0.5 text-amber-200/85 leading-relaxed">
-                GEMINI_API_KEY is not set on the server. Set your API key in the environment to ask questions about this video.
+                {aiStatusDetail ||
+                  'GEMINI_API_KEY is not set on the server. Set your API key in the environment to ask questions about this video.'}
               </p>
             </div>
           </div>
         )}
+
+        {!isSending &&
+          (aiStatus === 'quota_exhausted' ||
+            aiStatus === 'rate_limited' ||
+            aiStatus === 'temporarily_unavailable') && (
+            <div
+              data-testid="ai-status-warning-banner"
+              data-ai-status={aiStatus}
+              className="flex items-start gap-2.5 rounded-xl bg-rose-500/12 border border-rose-400/30 p-3 text-xs text-rose-100"
+            >
+              <AlertCircle className="w-4 h-4 text-rose-300 shrink-0 mt-0.5" aria-hidden="true" />
+              <div>
+                <p className="font-semibold text-rose-100">
+                  {aiStatus === 'quota_exhausted'
+                    ? 'AI Quota Exhausted'
+                    : aiStatus === 'rate_limited'
+                      ? 'Rate Limit Reached'
+                      : 'AI Temporarily Unavailable'}
+                </p>
+                <p className="mt-0.5 text-rose-200/85 leading-relaxed">
+                  {aiStatusDetail ||
+                    'The AI service could not complete the last request. You can retry shortly.'}
+                </p>
+              </div>
+            </div>
+          )}
 
         {messages.length === 0 ? (
           <div className="space-y-3.5 pt-0.5">
@@ -362,10 +463,10 @@ export function VideoChatWidget({
                 <button
                   key={prompt}
                   type="button"
-                  disabled={isSending || aiConfigured === false}
+                  disabled={isSending || aiStatus === 'not_configured'}
                   onClick={() => void sendQuestion(prompt)}
                   className={`w-full text-left rounded-xl bg-white/[0.035] hover:bg-violet-500/14 border border-white/[0.09] hover:border-violet-400/40 px-3.5 py-2.5 min-h-[44px] text-[13.5px] leading-snug text-slate-200 hover:text-white transition-colors ${
-                    aiConfigured === false ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'
+                    aiStatus === 'not_configured' ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'
                   }`}
                 >
                   {prompt}
@@ -475,16 +576,16 @@ export function VideoChatWidget({
           value={input}
           onChange={(e) => setInput(e.target.value)}
           placeholder={
-            aiConfigured === false
+            aiStatus === 'not_configured'
               ? 'AI service not configured on server (GEMINI_API_KEY required)...'
               : `Ask about this video (${LANG_LABEL[language]})...`
           }
-          disabled={isSending || aiConfigured === false}
+          disabled={isSending || aiStatus === 'not_configured'}
           className="flex-1 rounded-xl bg-white/[0.05] border border-white/12 px-3.5 py-2.5 min-h-[44px] text-sm text-white placeholder:text-slate-500 focus:outline-none focus:border-cyan-400/60 disabled:opacity-50"
         />
         <button
           type="submit"
-          disabled={!input.trim() || isSending || aiConfigured === false}
+          disabled={!input.trim() || isSending || aiStatus === 'not_configured'}
           aria-label="Send question"
           className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 text-white transition-colors cursor-pointer disabled:opacity-45"
         >

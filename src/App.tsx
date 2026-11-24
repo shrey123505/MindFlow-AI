@@ -27,6 +27,7 @@ import {
   resolveManualTranscriptIdentity,
 } from './utils/manualTranscript';
 import { buildVisualGuideCacheKey } from './utils/visualGuide';
+import { compactWorkspaceForVisualGuide } from './utils/serverGuards';
 import { copyTextWithFallback } from './utils/pdfExport';
 import {
   deleteLibraryItem,
@@ -49,6 +50,9 @@ import {
   MobileNodeDrawer,
 } from './components/MobileShell';
 import { VideoChatWidget } from './components/VideoChatWidget';
+import { AuthModal } from './components/AuthModal';
+import { apiFetch } from './utils/apiFetch';
+import type { AccountUsage, AccountUser, AuthSessionResponse } from './types/auth';
 
 // Code-split heavy modals & PDF generation dependencies out of the initial bundle
 const ExportModal = lazy(() =>
@@ -152,6 +156,10 @@ const ANALYSIS_STEPS = [
 
 export default function App() {
   const isDesktop = useIsDesktop();
+
+  const [accountUser, setAccountUser] = useState<AccountUser | null>(null);
+  const [accountUsage, setAccountUsage] = useState<AccountUsage | null>(null);
+  const [accountOpen, setAccountOpen] = useState(false);
 
   const [language, setLanguage] = useState<LanguageCode>('en');
   const [workspace, setWorkspace] = useState<LectureWorkspace>(SAMPLE_DSA_LECTURE);
@@ -280,6 +288,48 @@ export default function App() {
     },
     []
   );
+
+  const refreshAccount = useCallback(async () => {
+    try {
+      const response = await fetch('/api/auth/me', { credentials: 'same-origin' });
+      const data = (await response.json().catch(() => null)) as AuthSessionResponse | null;
+      if (!response.ok || !data) return;
+      setAccountUser(data.user ?? null);
+      setAccountUsage(data.usage ?? null);
+    } catch {
+      // Account status is optional for the built-in demo and will retry on the next API action.
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshAccount();
+    const onAuthRequired = () => setAccountOpen(true);
+    const onUsageUpdated = () => void refreshAccount();
+    window.addEventListener('mindflow:auth-required', onAuthRequired);
+    window.addEventListener('mindflow:usage-updated', onUsageUpdated);
+    return () => {
+      window.removeEventListener('mindflow:auth-required', onAuthRequired);
+      window.removeEventListener('mindflow:usage-updated', onUsageUpdated);
+    };
+  }, [refreshAccount]);
+
+  const handleAuthenticated = useCallback(
+    (session: AuthSessionResponse) => {
+      setAccountUser(session.user ?? null);
+      setAccountUsage(session.usage ?? null);
+      setAccountOpen(false);
+      showToast('Signed in. Your study tools are ready.');
+    },
+    [showToast]
+  );
+
+  const handleSignedOut = useCallback(() => {
+    setAccountUser(null);
+    setAccountUsage(null);
+    setAccountOpen(false);
+    setChatOpen(false);
+    showToast('You have been signed out.', 'info');
+  }, [showToast]);
 
   // Inform user if corrupted library data was recovered on startup
   useEffect(() => {
@@ -519,7 +569,7 @@ export default function App() {
 
     setSimplifyLoading(true);
     try {
-      const response = await fetch('/api/simplify', {
+      const response = await apiFetch('/api/simplify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -607,7 +657,7 @@ export default function App() {
       // Call fast /api/translate once and cache it per (videoId + language)
       setIsTranslating(true);
       try {
-        const response = await fetch('/api/translate', {
+      const response = await apiFetch('/api/translate', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -777,7 +827,7 @@ export default function App() {
           const controller = new AbortController();
           const timer = window.setTimeout(() => controller.abort(), 70000);
           try {
-            response = await fetch('/api/analyze', {
+            response = await apiFetch('/api/analyze', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: requestPayload,
@@ -925,10 +975,14 @@ export default function App() {
 
   /** Open & generate/load cached Long-Form Visual PDF Guide for (videoId + language) */
   const handleOpenVisualPdfStudio = useCallback(
-    async (forceRegenerate = false) => {
+    async (
+      forceRegenerate = false,
+      options?: { includeDiagrams?: boolean }
+    ) => {
       setVisualStudioOpen(true);
       setVisualGuideError(null);
 
+      const includeDiagrams = options?.includeDiagrams ?? true;
       const vKey = buildVisualGuideCacheKey(workspace.videoId, language);
 
       if (!forceRegenerate) {
@@ -952,14 +1006,18 @@ export default function App() {
       setActiveVisualGuide(null);
       setVisualGuideLoading(true);
       try {
-        const response = await fetch('/api/generate-visual-guide', {
+        const compactedAnalysis = compactWorkspaceForVisualGuide(
+          workspace as unknown as Record<string, unknown>
+        );
+        const response = await apiFetch('/api/generate-visual-guide', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             videoId: workspace.videoId,
-            analysisData: workspace,
+            analysisData: compactedAnalysis,
             language,
             guideLength: 'long',
+            includeDiagrams,
           }),
         });
         const data = await safeParseJsonResponse<{
@@ -1091,7 +1149,7 @@ export default function App() {
     setGroundingError(null);
 
     try {
-      const response = await fetch('/api/grounding/node', {
+      const response = await apiFetch('/api/grounding/node', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1150,6 +1208,8 @@ export default function App() {
           isTranslating={isTranslating}
           libraryCount={libraryItems.length}
           chatOpen={chatOpen}
+          accountUser={accountUser}
+          accountUsage={accountUsage}
           onUrlChange={(val) => {
             setUrlInput(val);
             if (urlError) {
@@ -1170,6 +1230,7 @@ export default function App() {
           onOpenLibrary={() => setLibraryOpen(true)}
           onOpenManualTranscript={() => setManualTranscriptOpen(true)}
           onToggleChat={() => setChatOpen((prev) => !prev)}
+          onOpenAccount={() => setAccountOpen(true)}
         />
 
         {/* Mobile Top Header */}
@@ -1182,6 +1243,8 @@ export default function App() {
           isAnalyzing={isAnalyzing}
           isTranslating={isTranslating}
           libraryCount={libraryItems.length}
+          accountUser={accountUser}
+          accountUsage={accountUsage}
           onToggleUrlBar={() => setMobileUrlOpen((prev) => !prev)}
           onUrlChange={(val) => {
             setUrlInput(val);
@@ -1198,14 +1261,24 @@ export default function App() {
           onUrlSubmit={() => runAnalysis()}
           onLanguageChange={handleLanguageChange}
           onOpenLibrary={() => setLibraryOpen(true)}
+          onOpenAccount={() => setAccountOpen(true)}
           onOpenManualTranscript={() => setManualTranscriptOpen(true)}
+        />
+
+        <AuthModal
+          open={accountOpen}
+          user={accountUser}
+          usage={accountUsage}
+          onClose={() => setAccountOpen(false)}
+          onAuthenticated={handleAuthenticated}
+          onSignedOut={handleSignedOut}
         />
 
         {/* ==================== DESKTOP SPLIT-SCREEN WORKSPACE (lg+) ==================== */}
         {isDesktop ? (
           <main
             ref={desktopMainRef}
-            className={`relative z-10 flex-1 w-full max-w-[1800px] mx-auto px-4 xl:px-5 pt-2 pb-4 flex items-stretch min-h-0 h-[calc(100vh-76px)] max-h-[calc(100vh-76px)] overflow-hidden ${
+            className={`relative z-10 flex-1 w-full max-w-[1800px] mx-auto px-4 xl:px-5 pt-2 pb-4 flex items-stretch min-h-0 h-[calc(100vh-100px)] max-h-[calc(100vh-100px)] overflow-hidden ${
               isResizingPane ? 'select-none cursor-col-resize' : ''
             }`}
           >
@@ -1514,6 +1587,10 @@ export default function App() {
             <span className="leading-snug">{toast.message}</span>
           </div>
         )}
+
+        <footer className="relative z-10 mt-auto px-4 pb-2 pt-1 text-center text-[11px] font-medium tracking-wide text-slate-500">
+          Built by Shrey <span className="mx-1.5 text-slate-700">·</span> MindFlow AI
+        </footer>
       </div>
 
       {/* Print-Isolated Visual PDF Guide Studio Modal (lazy-loaded with jsPDF) */}
@@ -1526,8 +1603,8 @@ export default function App() {
             isLoading={visualGuideLoading}
             error={visualGuideError}
             onClose={() => setVisualStudioOpen(false)}
-            onRetry={() => void handleOpenVisualPdfStudio(true)}
-            onGenerateLongGuide={() => void handleOpenVisualPdfStudio(true)}
+            onRetry={(opts) => void handleOpenVisualPdfStudio(true, opts)}
+            onGenerateLongGuide={(opts) => void handleOpenVisualPdfStudio(true, opts)}
             onNotify={showToast}
           />
         )}

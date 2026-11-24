@@ -6,12 +6,12 @@
   "scripts": {
     "dev": "tsx server.ts",
     "build:client": "vite build",
-    "build:server": "esbuild server.ts --bundle --platform=node --format=esm --target=node22 --outfile=dist/server.js --packages=external",
+    "build:server": "esbuild server.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist/server.js --packages=external",
     "build": "vite build && npm run build:server",
     "start": "node dist/server.js",
-    "test": "tsx --test src/utils/serverGuards.test.ts src/utils/mindflow.test.ts",
+    "test": "tsx --test src/utils/serverGuards.test.ts src/utils/mindflow.test.ts src/utils/authStore.test.ts",
     "preview": "vite preview",
-    "clean": "rm -rf dist server.js",
+    "clean": "rm -rf dist",
     "lint": "tsc --noEmit"
   },
   "dependencies": {

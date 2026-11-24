@@ -2,15 +2,23 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   classifyApiError,
+  classifyGeminiFailure,
   compactWorkspaceForChat,
+  compactWorkspaceForVisualGuide,
+  computeWorkspaceContentFingerprint,
   ConcurrencyLimiter,
+  executeWithGeminiRetry,
   hashCacheKey,
   InFlightDeduplicator,
+  isAllowedApiOrigin,
   isAllowedRasterImageMime,
   isAllowedYouTubeCaptionUrl,
   isAllowedYouTubeUserUrl,
   isModelFallbackNeeded,
   isRetryableGeminiError,
+  MAX_CHAT_WORKSPACE_BYTES,
+  MAX_VISUAL_GUIDE_WORKSPACE_BYTES,
+  measureUtf8Bytes,
   readResponseBufferWithLimit,
   resolveTrustProxySetting,
   sanitizeLogString,
@@ -19,7 +27,9 @@ import {
   TtlLruCache,
   sampleItemsStratified,
 } from './serverGuards.ts';
-import { sanitizeOptionalSvgDiagram } from './visualGuide.ts';
+import { sanitizeOptionalSvgDiagram, sanitizeSvgDiagram } from './visualGuide.ts';
+import { buildStandalonePrintableHtml } from './pdfExport.ts';
+import { SAMPLE_VISUAL_GUIDES_BY_LANGUAGE } from '../data/sampleVisualGuide.ts';
 import {
   LEGACY_LIBRARY_STORAGE_KEY_V3,
   LIBRARY_STORAGE_KEY,
@@ -525,5 +535,450 @@ describe('Release Readiness — Long-Video Coverage, Cache Correctness & Diagram
     assert.equal(authError.status, 503);
     assert.equal(authError.code, 'AI_AUTH_ERROR');
     assert.equal(authError.retryable, false);
+  });
+});
+
+describe('Final Engineering Completion — Fingerprinting, Byte Budgets, Cancellation, Retry & Security', () => {
+  it('computeWorkspaceContentFingerprint invalidates on later node, subNode, transcript line, and cheatSheet edits of identical length', () => {
+    const base = {
+      videoId: 'vid-fp-1',
+      title: 'Systems Architecture',
+      language: 'en',
+      tldw: ['Summary A'],
+      nodes: Array.from({ length: 12 }, (_, idx) => ({
+        id: `n-${idx}`,
+        title: `Topic ${idx}`,
+        shortSubtitle: `Sub ${idx}`,
+        keyPoints: [{ keyword: `Key${idx}`, detail: `Point A${idx}` }],
+        subNodes: [
+          {
+            id: `sn-${idx}`,
+            title: `Child ${idx}`,
+            keyPoints: [{ keyword: `SubKey${idx}`, detail: `Leaf A${idx}` }],
+          },
+        ],
+      })),
+      transcript: Array.from({ length: 12 }, (_, idx) => ({
+        id: `sec-${idx}`,
+        title: `Chapter ${idx}`,
+        keyTakeaway: `Takeaway ${idx}`,
+        lines: [{ timestampLabel: `${idx}:00`, text: `Original lecture text ${idx}` }],
+      })),
+      cheatSheet: {
+        definitions: [{ term: 'Throughput', summary: 'Requests per second', formulaOrNote: 'QPS' }],
+        quickRevision: ['Core 1'],
+      },
+    };
+
+    const fpBase = computeWorkspaceContentFingerprint(base);
+
+    // Edit the 11th node's subNode with identical string length
+    const editedLateNode = structuredClone(base);
+    editedLateNode.nodes[11].subNodes[0].keyPoints[0].detail = 'Leaf B11';
+    assert.notEqual(
+      computeWorkspaceContentFingerprint(editedLateNode),
+      fpBase,
+      'Editing a late subNode must invalidate fingerprint'
+    );
+
+    // Edit the 11th transcript section's line text with identical length
+    const editedLateTranscript = structuredClone(base);
+    editedLateTranscript.transcript[11].lines[0].text = 'Modified lecture text 11';
+    assert.notEqual(
+      computeWorkspaceContentFingerprint(editedLateTranscript),
+      fpBase,
+      'Editing a late transcript line must invalidate fingerprint'
+    );
+
+    // Edit cheatSheet
+    const editedCheatSheet = structuredClone(base);
+    editedCheatSheet.cheatSheet.definitions[0].summary = 'Packets per second ';
+    assert.notEqual(
+      computeWorkspaceContentFingerprint(editedCheatSheet),
+      fpBase,
+      'Editing cheatSheet must invalidate fingerprint'
+    );
+
+    // Different videoId or language cannot collide
+    const otherVideo = structuredClone(base);
+    otherVideo.videoId = 'vid-fp-2';
+    assert.notEqual(computeWorkspaceContentFingerprint(otherVideo), fpBase);
+
+    const otherLang = structuredClone(base);
+    otherLang.language = 'hi';
+    assert.notEqual(computeWorkspaceContentFingerprint(otherLang), fpBase);
+  });
+
+  it('compactWorkspaceForChat strictly enforces <= MAX_CHAT_WORKSPACE_BYTES on huge long videos while keeping start, middle, and end', () => {
+    const hugeTranscript = Array.from({ length: 200 }, (_, sIdx) => ({
+      id: `sec-${sIdx}`,
+      nodeId: `n-${sIdx}`,
+      title: `Chapter ${sIdx}: Deep Technical Walkthrough of Subsystem ${sIdx}`,
+      startSeconds: sIdx * 45,
+      startLabel: `${Math.floor((sIdx * 45) / 60)}:${String((sIdx * 45) % 60).padStart(2, '0')}`,
+      keyTakeaway: `Key takeaway for chapter ${sIdx} `.repeat(6),
+      lines: Array.from({ length: 20 }, (__, lIdx) => ({
+        id: `l-${sIdx}-${lIdx}`,
+        timestampSeconds: sIdx * 45 + lIdx * 2,
+        timestampLabel: `${sIdx}:${String(lIdx).padStart(2, '0')}`,
+        text: `Detailed spoken transcript sentence ${sIdx}-${lIdx} explaining performance invariants and tradeoffs. `.repeat(3),
+      })),
+    }));
+
+    const hugeNodes = Array.from({ length: 120 }, (_, nIdx) => ({
+      id: `node-${nIdx}`,
+      title: `Concept Node ${nIdx}`,
+      shortSubtitle: `Summary of concept ${nIdx} `.repeat(4),
+      timestampSeconds: nIdx * 60,
+      timestampLabel: `${nIdx}:00`,
+      keyPoints: Array.from({ length: 6 }, (__, k) => `Key point ${nIdx}-${k}: `.repeat(8)),
+      realLifeExample: `Real-world production example for node ${nIdx}. `.repeat(6),
+      simplifiedAnalogy: `Everyday analogy for node ${nIdx}. `.repeat(6),
+      subNodes: Array.from({ length: 6 }, (__, c) => ({
+        id: `sub-${nIdx}-${c}`,
+        title: `Sub-topic ${nIdx}.${c}`,
+        shortSubtitle: `Details ${nIdx}.${c}`,
+        timestampSeconds: nIdx * 60 + c * 5,
+        timestampLabel: `${nIdx}:${String(c * 5).padStart(2, '0')}`,
+        keyPoints: [`Sub-point A ${nIdx}.${c}`.repeat(5)],
+      })),
+    }));
+
+    const rawWorkspace = {
+      videoId: 'massive-3hr-lecture',
+      title: 'Complete 3-Hour Systems Course',
+      channel: 'Engineering Channel',
+      language: 'en',
+      nodes: hugeNodes,
+      transcript: hugeTranscript,
+      cheatSheet: {
+        coreTakeaways: Array.from({ length: 20 }, (_, i) => `Takeaway ${i} `.repeat(10)),
+        actionableChecklist: Array.from({ length: 20 }, (_, i) => `Checklist ${i} `.repeat(10)),
+      },
+    };
+
+    const rawBytes = measureUtf8Bytes(JSON.stringify(rawWorkspace));
+    assert.ok(rawBytes > 1_000_000, `Test fixture should exceed 1 MB (got ${rawBytes} bytes)`);
+
+    const compacted = compactWorkspaceForChat(rawWorkspace);
+    const compactedBytes = measureUtf8Bytes(JSON.stringify(compacted));
+    assert.ok(
+      compactedBytes <= MAX_CHAT_WORKSPACE_BYTES,
+      `Compacted chat payload (${compactedBytes} B) must stay <= ${MAX_CHAT_WORKSPACE_BYTES} B`
+    );
+
+    const sections = compacted.transcript as Array<{ id: string }>;
+    const nodes = compacted.nodes as Array<{ id: string }>;
+    assert.equal(sections[0].id, 'sec-0', 'Beginning of long video must be preserved');
+    assert.equal(sections[sections.length - 1].id, 'sec-199', 'End of long video must be preserved');
+    assert.ok(
+      sections.some((s) => {
+        const num = Number(s.id.replace('sec-', ''));
+        return num >= 85 && num <= 115;
+      }),
+      'Middle of long video must remain represented'
+    );
+    assert.equal(nodes[0].id, 'node-0');
+    assert.equal(nodes[nodes.length - 1].id, 'node-119');
+
+    // Visual guide compaction also enforces its byte ceiling strictly
+    const compactedGuide = compactWorkspaceForVisualGuide(rawWorkspace);
+    const guideBytes = measureUtf8Bytes(JSON.stringify(compactedGuide));
+    assert.ok(
+      guideBytes <= MAX_VISUAL_GUIDE_WORKSPACE_BYTES,
+      `Compacted visual guide payload (${guideBytes} B) must stay <= ${MAX_VISUAL_GUIDE_WORKSPACE_BYTES} B`
+    );
+  });
+
+  it('InFlightDeduplicator aborts shared work only when ALL subscribers disconnect', async () => {
+    const dedup = new InFlightDeduplicator();
+    const sharedHolder: { signal: AbortSignal | null } = { signal: null };
+    let resolveWork!: (val: string) => void;
+
+    const ac1 = new AbortController();
+    const ac2 = new AbortController();
+
+    const p1 = dedup.run(
+      'shared-key',
+      (sharedSignal) => {
+        sharedHolder.signal = sharedSignal;
+        return new Promise<string>((resolve) => {
+          resolveWork = resolve;
+        });
+      },
+      { signal: ac1.signal }
+    );
+    const p2 = dedup.run(
+      'shared-key',
+      () => {
+        throw new Error('Factory must not run twice for deduplicated key');
+      },
+      { signal: ac2.signal }
+    );
+
+    // Caller 1 disconnects — Caller 1 rejects, but sharedSignal stays alive for Caller 2
+    ac1.abort();
+    await assert.rejects(p1, /aborted/i);
+    assert.equal(sharedHolder.signal?.aborted, false, 'Shared work must continue for remaining waiter');
+
+    resolveWork('completed-ok');
+    assert.equal(await p2, 'completed-ok');
+
+    // Now test when ALL callers disconnect
+    const soloHolder: { signal: AbortSignal | null } = { signal: null };
+    const soloAc = new AbortController();
+    const soloPromise = dedup.run(
+      'solo-key',
+      (sig) => {
+        soloHolder.signal = sig;
+        return new Promise<string>((_resolve, reject) => {
+          sig.addEventListener('abort', () => reject(new Error('downstream cancelled')), { once: true });
+        });
+      },
+      { signal: soloAc.signal }
+    );
+
+    soloAc.abort();
+    await assert.rejects(soloPromise);
+    assert.equal(soloHolder.signal?.aborted, true, 'Shared signal must abort when last subscriber disconnects');
+  });
+
+  it('executeWithGeminiRetry separates hard quota exhaustion, transient 429 Retry-After, 503 capacity fallback, and real AbortSignal cancellation', async () => {
+    const models = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'] as const;
+
+    // 1a. Per-model 429 quota exhausted on primary model -> immediately falls back to gemini-3.1-flash-lite
+    const quotaFallbackModels: string[] = [];
+    const quotaRecovered = await executeWithGeminiRetry({
+      models,
+      timeoutMs: 5000,
+      sleepFn: async () => {},
+      invoke: async (model) => {
+        quotaFallbackModels.push(model);
+        if (model === 'gemini-4-hydrogen') {
+          throw new Error('429 RESOURCE_EXHAUSTED: Free tier daily quota exhausted (limit: 0)');
+        }
+        return `recovered:${model}`;
+      },
+    });
+    assert.equal(quotaRecovered, 'recovered:gemini-3.1-flash-lite');
+    assert.deepEqual(quotaFallbackModels, ['gemini-4-hydrogen', 'gemini-3.1-flash-lite']);
+
+    // 1b. Hard quota exhausted across ALL models -> fails fast after trying each model once (no 2nd round)
+    let hardQuotaCalls = 0;
+    await assert.rejects(
+      executeWithGeminiRetry({
+        models,
+        timeoutMs: 5000,
+        sleepFn: async () => {},
+        invoke: async () => {
+          hardQuotaCalls++;
+          throw new Error('429 RESOURCE_EXHAUSTED: Free tier daily quota exhausted (limit: 0)');
+        },
+      }),
+      /quota exhausted/i
+    );
+    assert.equal(hardQuotaCalls, models.length);
+
+    // Verify classifyGeminiFailure & classifyApiError agree on hard daily quota vs standard Google 429 boilerplate
+    assert.equal(
+      classifyGeminiFailure(new Error('429 RESOURCE_EXHAUSTED: Free tier daily quota exhausted')).kind,
+      'quota_exhausted'
+    );
+    assert.equal(
+      classifyGeminiFailure(
+        new Error('429 RESOURCE_EXHAUSTED: You exceeded your current quota, please check your plan and billing details.')
+      ).kind,
+      'rate_limited'
+    );
+    const classifiedHard = classifyApiError(
+      new Error('429 RESOURCE_EXHAUSTED: Free tier daily quota exhausted (limit: 0)'),
+      'Fallback'
+    );
+    assert.equal(classifiedHard.status, 429);
+    assert.equal(classifiedHard.code, 'AI_QUOTA_EXHAUSTED');
+    assert.equal(classifiedHard.retryable, false);
+
+    // 2. Transient 429 with Retry-After -> respects provider delay and succeeds on bounded retry
+    const sleptMs: number[] = [];
+    let rpmCalls = 0;
+    const rpmResult = await executeWithGeminiRetry({
+      models,
+      timeoutMs: 5000,
+      sleepFn: async (ms) => {
+        sleptMs.push(ms);
+      },
+      invoke: async (model) => {
+        rpmCalls++;
+        if (rpmCalls === 1) {
+          throw new Error('429 Too Many Requests: Rate limit exceeded. Retry after 3s.');
+        }
+        return `ok:${model}`;
+      },
+    });
+    assert.equal(rpmResult, 'ok:gemini-4-hydrogen');
+    assert.equal(rpmCalls, 2);
+    assert.equal(sleptMs.length, 1);
+    assert.ok(
+      sleptMs[0] >= 3000 && sleptMs[0] <= 3250,
+      `Expected Retry-After 3s + bounded jitter, got ${sleptMs[0]}ms`
+    );
+
+    // 3. 503 capacity error -> retries across models with bounded backoff and falls back cleanly
+    const calledModels: string[] = [];
+    const backoffDelays: number[] = [];
+    const fallbackResult = await executeWithGeminiRetry({
+      models,
+      timeoutMs: 5000,
+      randomFn: () => 0.5,
+      sleepFn: async (ms) => {
+        backoffDelays.push(ms);
+      },
+      invoke: async (model) => {
+        calledModels.push(model);
+        if (model === 'gemini-4-hydrogen') {
+          throw new Error('503 Service Unavailable: The model is overloaded.');
+        }
+        return `recovered:${model}`;
+      },
+    });
+    assert.equal(fallbackResult, 'recovered:gemini-3.1-flash-lite');
+    assert.deepEqual(calledModels, ['gemini-4-hydrogen', 'gemini-3.1-flash-lite']);
+    assert.equal(backoffDelays.length, 1);
+    assert.ok(backoffDelays[0] >= 300 && backoffDelays[0] <= 600);
+
+    // 4. Timeout aborts the attempt AbortSignal passed to SDK before trying fallback (even when fetch throws generic AbortError)
+    let firstAttemptSignalAborted = false;
+    const timeoutFallback = await executeWithGeminiRetry({
+      models,
+      timeoutMs: 25,
+      sleepFn: async () => {},
+      invoke: async (model, attemptSignal) => {
+        if (model === 'gemini-4-hydrogen') {
+          return new Promise<string>((_resolve, reject) => {
+            attemptSignal.addEventListener(
+              'abort',
+              () => {
+                firstAttemptSignalAborted = true;
+                const abortErr = new Error('This operation was aborted');
+                abortErr.name = 'AbortError';
+                reject(abortErr);
+              },
+              { once: true }
+            );
+          });
+        }
+        assert.equal(
+          firstAttemptSignalAborted,
+          true,
+          'Previous timed-out attempt signal must be aborted before fallback starts'
+        );
+        return `fallback:${model}`;
+      },
+    });
+    assert.equal(timeoutFallback, 'fallback:gemini-3.1-flash-lite');
+
+    // 5. Parent client abort immediately stops execution without invoking fallback
+    const parentAc = new AbortController();
+    let invocationsAfterAbort = 0;
+    const abortedPromise = executeWithGeminiRetry({
+      models,
+      timeoutMs: 5000,
+      parentSignal: parentAc.signal,
+      sleepFn: async () => {},
+      invoke: async (_model, attemptSignal) => {
+        invocationsAfterAbort++;
+        return new Promise<string>((_resolve, reject) => {
+          attemptSignal.addEventListener(
+            'abort',
+            () => reject(attemptSignal.reason ?? new Error('client disconnected')),
+            { once: true }
+          );
+        });
+      },
+    });
+    parentAc.abort();
+    await assert.rejects(abortedPromise);
+    assert.equal(invocationsAfterAbort, 1, 'Client disconnect must never trigger fallback model');
+  });
+
+  it('isAllowedApiOrigin blocks third-party cross-site POST origins while allowing same-origin, reverse-proxy, AI Studio preview, loopback, and allowlisted origins', () => {
+    assert.equal(isAllowedApiOrigin(undefined, 'app.mindflow.ai'), true);
+    assert.equal(isAllowedApiOrigin('https://app.mindflow.ai', 'app.mindflow.ai'), true);
+    assert.equal(isAllowedApiOrigin('http://localhost:3000', 'localhost:3000'), true);
+    assert.equal(isAllowedApiOrigin('http://127.0.0.1:5173', 'localhost:3000'), true);
+    assert.equal(isAllowedApiOrigin('https://evil.attacker.com', 'app.mindflow.ai'), false);
+    assert.equal(
+      isAllowedApiOrigin('https://evil.attacker.com', 'localhost:3000', undefined, {
+        secFetchSite: 'cross-site',
+        appUrl: 'https://ais-dev-abc123.asia-east1.run.app',
+      }),
+      false
+    );
+    assert.equal(isAllowedApiOrigin('null', 'app.mindflow.ai'), false);
+    // Reverse-proxy same-origin via Sec-Fetch-Site
+    assert.equal(
+      isAllowedApiOrigin('https://ais-dev-abc123.asia-east1.run.app', 'localhost:3000', undefined, {
+        secFetchSite: 'same-origin',
+      }),
+      true
+    );
+    // Reverse-proxy same-origin via X-Forwarded-Host
+    assert.equal(
+      isAllowedApiOrigin('https://mindflow.example.com', 'localhost:3000', undefined, {
+        forwardedHost: 'mindflow.example.com',
+      }),
+      true
+    );
+    // Platform APP_URL + paired AI Studio dev <-> pre preview URLs
+    assert.equal(
+      isAllowedApiOrigin('https://ais-dev-abc123.asia-east1.run.app', 'localhost:3000', undefined, {
+        appUrl: 'https://ais-dev-abc123.asia-east1.run.app',
+      }),
+      true
+    );
+    assert.equal(
+      isAllowedApiOrigin('https://ais-pre-abc123.asia-east1.run.app', 'localhost:3000', undefined, {
+        appUrl: 'https://ais-dev-abc123.asia-east1.run.app',
+      }),
+      true
+    );
+    assert.equal(
+      isAllowedApiOrigin(
+        'https://staging.mindflow.ai',
+        'api.mindflow.ai',
+        'https://staging.mindflow.ai, https://prod.mindflow.ai'
+      ),
+      true
+    );
+  });
+
+  it('sanitizeSvgDiagram strips advanced XSS vectors and buildStandalonePrintableHtml respects showDiagrams toggle', () => {
+    const maliciousSvg =
+      '<svg viewBox="0 0 200 100"><animateTransform attributeName="transform" onbegin="alert(1)"/><a href=javascript:alert(2)><rect width="50" height="50" fill="url(https://evil.example/a.svg#x)"/></a><text x="10" y="20">Safe Node</text></svg>';
+    const safeSvg = sanitizeSvgDiagram(maliciousSvg, 'Fallback', ['Term']);
+    assert.ok(!/animateTransform/i.test(safeSvg));
+    assert.ok(!/javascript:/i.test(safeSvg));
+    assert.ok(!/onbegin/i.test(safeSvg));
+    assert.ok(!/evil\.example/i.test(safeSvg));
+    assert.ok(safeSvg.includes('Safe Node'));
+
+    const sampleGuide = SAMPLE_VISUAL_GUIDES_BY_LANGUAGE.en;
+    const htmlWithDiagrams = buildStandalonePrintableHtml(sampleGuide, {
+      theme: 'warm',
+      showVideoFrames: true,
+      showWebImages: true,
+      showDiagrams: true,
+      showInsights: true,
+    });
+    const htmlWithoutDiagrams = buildStandalonePrintableHtml(sampleGuide, {
+      theme: 'warm',
+      showVideoFrames: true,
+      showWebImages: true,
+      showDiagrams: false,
+      showInsights: true,
+    });
+    assert.ok(htmlWithDiagrams.includes('<div class="diagram-box">'));
+    assert.ok(!htmlWithoutDiagrams.includes('<div class="diagram-box">'));
+    assert.ok(!htmlWithoutDiagrams.includes('<svg'));
   });
 });

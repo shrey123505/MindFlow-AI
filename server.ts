@@ -2,8 +2,15 @@ import 'dotenv/config';
 import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
+import { timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { GoogleGenAI, ThinkingLevel, Type, type Schema } from '@google/genai';
+import {
+  AuthStoreError,
+  PersistentAuthStore,
+  type AuthUser,
+  type UsagePolicy,
+} from './src/utils/authStore.ts';
 import {
   buildProxyImageUrl,
   buildYouTubeFrameUrl,
@@ -48,14 +55,15 @@ import {
 import type { LectureWorkspace } from './src/types/mindflow.ts';
 import {
   classifyApiError,
+  computeWorkspaceContentFingerprint,
   ConcurrencyLimiter,
+  executeWithGeminiRetry,
   hashCacheKey,
   InFlightDeduplicator,
+  isAllowedApiOrigin,
   isAllowedRasterImageMime,
   isAllowedYouTubeCaptionUrl,
   isAllowedYouTubeUserUrl,
-  isModelFallbackNeeded,
-  isRetryableGeminiError,
   readResponseBufferWithLimit,
   resolveTrustProxySetting,
   sanitizeLogString,
@@ -68,10 +76,75 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT ?? 3000);
-const isProduction = process.env.NODE_ENV === 'production';
+const isCompiledProductionBundle =
+  path.basename(__filename) === 'server.js' &&
+  fs.existsSync(path.join(__dirname, 'index.html')) &&
+  fs.existsSync(path.join(__dirname, 'assets'));
+const isProduction =
+  process.env.NODE_ENV === 'production' || isCompiledProductionBundle;
 const FREE_TIER_MODELS = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'] as const;
 
 type LanguageCode = 'en' | 'hi' | 'hinglish';
+
+/**
+ * Tracks actual HTTP client disconnects safely on Node 18/20/22+.
+ * Note: Listening on `req.on('close')` fires immediately once the request body finishes
+ * streaming in Node 16+, whereas `res.on('close')` with `!res.writableEnded` accurately
+ * fires only when the client disconnects before the response completes.
+ */
+function createClientAbortController(res: express.Response): {
+  controller: AbortController;
+  cleanup: () => void;
+} {
+  const controller = new AbortController();
+  const onClose = () => {
+    if (!res.writableEnded) {
+      controller.abort(new Error('Client connection closed.'));
+    }
+  };
+  res.on('close', onClose);
+  return {
+    controller,
+    cleanup: () => {
+      res.off('close', onClose);
+    },
+  };
+}
+
+/**
+ * Links a bounded timeout controller to an optional parent AbortSignal and cleans up listeners.
+ */
+function createLinkedTimeoutController(
+  timeoutMs: number,
+  label: string,
+  parentSignal?: AbortSignal
+): { controller: AbortController; cleanup: () => void } {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(new Error(`${label} timed out after ${Math.max(1, Math.round(timeoutMs / 1000))}s`));
+  }, timeoutMs);
+
+  const onParentAbort = () => {
+    controller.abort(parentSignal?.reason ?? new Error('Client connection closed.'));
+  };
+
+  if (parentSignal) {
+    if (parentSignal.aborted) {
+      clearTimeout(timer);
+      controller.abort(parentSignal.reason ?? new Error('Client connection closed.'));
+    } else {
+      parentSignal.addEventListener('abort', onParentAbort, { once: true });
+    }
+  }
+
+  return {
+    controller,
+    cleanup: () => {
+      clearTimeout(timer);
+      parentSignal?.removeEventListener('abort', onParentAbort);
+    },
+  };
+}
 
 function sendClassifiedApiError(
   res: express.Response,
@@ -82,6 +155,9 @@ function sendClassifiedApiError(
 ): void {
   const classified = classifyApiError(error, fallbackMessage);
   console.warn(`[MindFlow API:${context}] ${classified.code} (${classified.status}) — ${sanitizeLogString(error)}`);
+  if (res.headersSent || res.writableEnded || res.destroyed) {
+    return;
+  }
   if (classified.retryAfterSeconds) {
     res.setHeader('Retry-After', String(classified.retryAfterSeconds));
   }
@@ -91,28 +167,6 @@ function sendClassifiedApiError(
     retryable: classified.retryable,
     ...(classified.retryAfterSeconds ? { retryAfterSeconds: classified.retryAfterSeconds } : {}),
     ...(extra ?? {}),
-  });
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`));
-    }, ms);
-    promise.then(
-      (val) => {
-        clearTimeout(timer);
-        resolve(val);
-      },
-      (err) => {
-        clearTimeout(timer);
-        reject(err);
-      }
-    );
   });
 }
 
@@ -145,12 +199,29 @@ function stripThinkingConfig(
   return { ...params, config: clonedConfig };
 }
 
+const modelRateLimitCooldownUntil = new Map<string, number>();
+
+function getOrderedFreeTierModels(now = Date.now()): readonly string[] {
+  const active: string[] = [];
+  const cooledDown: string[] = [];
+  for (const m of FREE_TIER_MODELS) {
+    const until = modelRateLimitCooldownUntil.get(m) ?? 0;
+    if (until > now) {
+      cooledDown.push(m);
+    } else {
+      active.push(m);
+    }
+  }
+  return [...active, ...cooledDown];
+}
+
 /**
- * Resilient Gemini caller with controlled backoff + jitter across official free-tier models.
- * - Enforces per-attempt AbortSignal cancellation so timed-out/failed requests do not linger or overlap.
- * - Respects client disconnects via parentSignal.
- * - Handles HTTP 429 quota/rate-limit errors with exponential backoff and provider delay guidance.
- * - Automatically strips thinkingConfig if a fallback model does not support it.
+ * Resilient Gemini caller powered by `executeWithGeminiRetry` across configured models:
+ * - Forwards a per-attempt AbortSignal to `@google/genai` `config.abortSignal` (which passes it to `fetch`).
+ * - Respects client disconnects via `parentSignal` (including aborting retry backoff sleep).
+ * - Handles 429 hard quota exhaustion and 429 rate limits with per-model fallback across `FREE_TIER_MODELS`
+ *   plus a 60s per-model 429 cooldown so multi-step pipelines immediately use `gemini-3.1-flash-lite`.
+ * - Automatically strips `thinkingConfig` on `gemini-3.1-flash-lite` fallback for compatibility.
  */
 async function generateWithFreeTierFallback(
   ai: GoogleGenAI,
@@ -159,103 +230,33 @@ async function generateWithFreeTierFallback(
   maxRounds = 2,
   options?: { parentSignal?: AbortSignal }
 ) {
-  let lastError: unknown = null;
-  let primaryTransientError: unknown = null;
-  const perAttemptTimeout = Math.max(10000, Math.min(timeoutMs, 45000));
-
-  for (let round = 0; round < maxRounds; round++) {
-    for (let i = 0; i < FREE_TIER_MODELS.length; i++) {
-      if (options?.parentSignal?.aborted) {
-        throw options.parentSignal.reason ?? new Error('Client aborted request.');
-      }
-
-      const model = FREE_TIER_MODELS[i];
-      // Omit thinkingConfig on flash-lite fallback to maximize compatibility & speed
+  return executeWithGeminiRetry({
+    models: getOrderedFreeTierModels(),
+    timeoutMs: Math.max(10_000, Math.min(timeoutMs, 45_000)),
+    maxRounds,
+    parentSignal: options?.parentSignal,
+    invoke: async (model, attemptSignal) => {
       const adapted =
         model === 'gemini-3.1-flash-lite' ? stripThinkingConfig(params) : params;
-
-      const attemptController = new AbortController();
-      const timer = setTimeout(() => {
-        attemptController.abort(
-          new Error(`Gemini (${model}) timed out after ${Math.round(perAttemptTimeout / 1000)}s`)
-        );
-      }, perAttemptTimeout);
-
-      const onParentAbort = () => {
-        attemptController.abort(options?.parentSignal?.reason ?? new Error('Client aborted request.'));
-      };
-
-      if (options?.parentSignal) {
-        options.parentSignal.addEventListener('abort', onParentAbort, { once: true });
-      }
-
       try {
-        const response = await ai.models.generateContent({
+        return await ai.models.generateContent({
           ...adapted,
           model,
           config: {
             ...(adapted.config ?? {}),
-            abortSignal: attemptController.signal,
+            abortSignal: attemptSignal,
           },
         });
-        clearTimeout(timer);
-        return response;
       } catch (err) {
-        clearTimeout(timer);
-        // Explicitly abort connection so previous attempt does not overlap with fallback
-        attemptController.abort();
-
-        if (options?.parentSignal?.aborted) {
-          throw options.parentSignal.reason ?? err;
+        const msg = err instanceof Error ? err.message : String(err ?? '');
+        const status = Number((err as { status?: number; code?: number } | null)?.status ?? 0);
+        if (status === 429 || /\b429\b|RESOURCE_EXHAUSTED|quota|rate limit/i.test(msg)) {
+          modelRateLimitCooldownUntil.set(model, Date.now() + 60_000);
         }
-
-        lastError = err;
-        const errStr = String(err);
-        const is429 =
-          (err as { status?: number })?.status === 429 ||
-          /429|RESOURCE_EXHAUSTED|quota|rate limit/i.test(errStr);
-        const canFallbackModel = isModelFallbackNeeded(err);
-        const canRetryTransient = isRetryableGeminiError(err);
-
-        if (canRetryTransient && !primaryTransientError) {
-          primaryTransientError = err;
-        }
-
-        if (!canFallbackModel && !canRetryTransient) {
-          throw err;
-        }
-
-        const isLastModel = i === FREE_TIER_MODELS.length - 1;
-        const isLastRound = round === maxRounds - 1;
-
-        // If rate limit / quota exhaustion occurred on all free models in round 0, fail fast with accurate quota error
-        if (is429 && isLastModel && /quota.*exceeded|daily.*limit|resource_exhausted/i.test(errStr)) {
-          throw primaryTransientError ?? err;
-        }
-
-        if (isLastModel && isLastRound) {
-          throw primaryTransientError ?? err;
-        }
-
-        // Provider retry guidance / exponential backoff
-        let delayMs = is429 ? 1400 * (round + 1) : (isLastModel ? 650 * (round + 1) : 250);
-        const retryMatch = errStr.match(/retry(?:ing)? after (\d+)|reset in (\d+)/i);
-        if (retryMatch) {
-          const parsedSec = Number(retryMatch[1] || retryMatch[2]);
-          if (parsedSec > 0 && parsedSec <= 15) {
-            delayMs = Math.max(delayMs, parsedSec * 1000);
-          }
-        }
-        const jitter = Math.floor(Math.random() * 180);
-        await sleep(delayMs + jitter);
-      } finally {
-        if (options?.parentSignal) {
-          options.parentSignal.removeEventListener('abort', onParentAbort);
-        }
+        throw err;
       }
-    }
-  }
-  throw primaryTransientError ?? lastError ?? new Error('Gemini request failed.');
+    },
+  });
 }
 
 function createGeminiClient(): GoogleGenAI | null {
@@ -285,9 +286,15 @@ interface OEmbedInfo {
 }
 
 /** Layer 1: Safely fetch YouTube title & channel via public oEmbed with 4s timeout */
-async function fetchYouTubeOEmbed(videoId: string): Promise<OEmbedInfo> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 4000);
+async function fetchYouTubeOEmbed(
+  videoId: string,
+  parentSignal?: AbortSignal
+): Promise<OEmbedInfo> {
+  const { controller, cleanup } = createLinkedTimeoutController(
+    4000,
+    'YouTube oEmbed',
+    parentSignal
+  );
 
   try {
     const oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(
@@ -313,7 +320,7 @@ async function fetchYouTubeOEmbed(videoId: string): Promise<OEmbedInfo> {
   } catch {
     return {};
   } finally {
-    clearTimeout(timeout);
+    cleanup();
   }
 }
 
@@ -414,9 +421,15 @@ async function fetchCaptionSegments(
  * Queries both YouTube InnerTube player API and watch page HTML in parallel
  * with bounded timeouts so datacenter blocks never hang the request.
  */
-async function fetchYouTubeBundle(videoId: string): Promise<YouTubeExtractedBundle> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 6500);
+async function fetchYouTubeBundle(
+  videoId: string,
+  parentSignal?: AbortSignal
+): Promise<YouTubeExtractedBundle> {
+  const { controller, cleanup } = createLinkedTimeoutController(
+    6500,
+    'YouTube bundle',
+    parentSignal
+  );
 
   try {
     const [innerTubeResult, watchHtmlResult] = await Promise.allSettled([
@@ -555,7 +568,7 @@ async function fetchYouTubeBundle(videoId: string): Promise<YouTubeExtractedBund
   } catch {
     return { captionSegments: [], chapters: [] };
   } finally {
-    clearTimeout(timeout);
+    cleanup();
   }
 }
 
@@ -1232,6 +1245,26 @@ async function startServer() {
   app.disable('x-powered-by');
   app.set('trust proxy', resolveTrustProxySetting(process.env));
 
+  const authStorePath =
+    process.env.MINDFLOW_AUTH_STORE_PATH?.trim() ||
+    path.resolve(process.cwd(), 'data', 'auth-store.json');
+  const authStore = new PersistentAuthStore(authStorePath);
+  await authStore.initialize();
+  const usagePolicy: UsagePolicy = {
+    analysisLimit: Math.min(
+      25,
+      Math.max(1, Number.parseInt(process.env.MINDFLOW_DAILY_ANALYSIS_LIMIT ?? '3', 10) || 3)
+    ),
+    aiActionLimit: Math.min(
+      200,
+      Math.max(1, Number.parseInt(process.env.MINDFLOW_DAILY_AI_ACTION_LIMIT ?? '20', 10) || 20)
+    ),
+    globalDailyLimit: Math.min(
+      10_000,
+      Math.max(1, Number.parseInt(process.env.MINDFLOW_AI_DAILY_GLOBAL_LIMIT ?? '50', 10) || 50)
+    ),
+  };
+
   app.use((_req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
@@ -1239,7 +1272,75 @@ async function startServer() {
     next();
   });
 
-  // Per-endpoint rate limiters tuned to protect quotas without disrupting normal study workflows
+  // Origin protection for state-changing /api/* requests (protects shared backend Gemini key against cross-site abuse)
+  app.use('/api', (req, res, next) => {
+    if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') {
+      next();
+      return;
+    }
+    if (
+      !isAllowedApiOrigin(req.headers.origin, req.headers.host, process.env.ALLOWED_ORIGINS, {
+        forwardedHost: req.headers['x-forwarded-host'],
+        secFetchSite: req.headers['sec-fetch-site'],
+        appUrl: process.env.APP_URL,
+      })
+    ) {
+      res.status(403).json({
+        error: 'Cross-origin API requests are not permitted from this origin.',
+        code: 'ORIGIN_NOT_ALLOWED',
+        retryable: false,
+      });
+      return;
+    }
+    const requiredToken = process.env.MINDFLOW_API_ACCESS_TOKEN?.trim();
+    const isAuthBootstrapRoute = req.path.startsWith('/auth/');
+    if (requiredToken && !isAuthBootstrapRoute) {
+      const cookieHeader = typeof req.headers.cookie === 'string' ? req.headers.cookie : '';
+      const sessionCookie = cookieHeader
+        .split(';')
+        .map((part) => part.trim())
+        .find((part) => part.startsWith('mindflow_session='));
+      const sessionToken = sessionCookie?.slice('mindflow_session='.length) || null;
+      void authStore
+        .getUserForSession(sessionToken)
+        .then((user) => {
+          if (user) {
+            next();
+            return;
+          }
+          const headerToken =
+            req.headers['x-mindflow-token'] ?? req.headers['x-mindflow-access-token'];
+          const rawProvided =
+            typeof headerToken === 'string'
+              ? headerToken.trim()
+              : typeof req.headers.authorization === 'string' &&
+                  req.headers.authorization.startsWith('Bearer ')
+                ? req.headers.authorization.slice(7).trim()
+                : '';
+          const a = Buffer.from(rawProvided, 'utf8');
+          const b = Buffer.from(requiredToken, 'utf8');
+          const matches = a.length === b.length && timingSafeEqual(a, b);
+          if (!matches) {
+            res.status(401).json({
+              error: 'A valid MindFlow account session is required.',
+              code: 'AUTH_REQUIRED',
+              retryable: false,
+            });
+            return;
+          }
+          next();
+        })
+        .catch(next);
+      return;
+    }
+    next();
+  });
+
+  // Per-endpoint rate limiters + sustained hourly AI budget to protect shared backend Gemini quotas
+  const hourlyAiBudgetLimiter = new SlidingWindowRateLimiter({
+    windowMs: 60 * 60_000,
+    maxRequests: Math.max(20, Number(process.env.AI_HOURLY_IP_LIMIT ?? 120) || 120),
+  });
   const rateLimiters = {
     analyze: new SlidingWindowRateLimiter({ windowMs: 60_000, maxRequests: 10 }),
     translate: new SlidingWindowRateLimiter({ windowMs: 60_000, maxRequests: 15 }),
@@ -1286,10 +1387,12 @@ async function startServer() {
 
   const withRateLimit = (
     limiter: SlidingWindowRateLimiter,
-    endpointName: string
+    endpointName: string,
+    enforceHourlyAiBudget = true
   ): express.RequestHandler => {
     return (req, res, next) => {
-      const decision = limiter.check(`${endpointName}:${getClientKey(req)}`);
+      const clientKey = getClientKey(req);
+      const decision = limiter.check(`${endpointName}:${clientKey}`);
       res.setHeader('X-RateLimit-Limit', String(decision.limit));
       res.setHeader('X-RateLimit-Remaining', String(decision.remaining));
       if (!decision.allowed) {
@@ -1302,8 +1405,210 @@ async function startServer() {
         });
         return;
       }
+      if (enforceHourlyAiBudget) {
+        const hourlyDecision = hourlyAiBudgetLimiter.check(`ai-hourly:${clientKey}`);
+        if (!hourlyDecision.allowed) {
+          res.setHeader('Retry-After', String(hourlyDecision.resetAfterSeconds));
+          res.status(429).json({
+            error: 'Hourly AI usage budget reached for this connection. Please try again later.',
+            code: 'AI_HOURLY_BUDGET_EXCEEDED',
+            retryable: true,
+            retryAfterSeconds: hourlyDecision.resetAfterSeconds,
+          });
+          return;
+        }
+      }
       next();
     };
+  };
+
+  const signupLimiter = new SlidingWindowRateLimiter({ windowMs: 60 * 60_000, maxRequests: 5 });
+  const loginLimiter = new SlidingWindowRateLimiter({ windowMs: 15 * 60_000, maxRequests: 12 });
+  const withAuthAttemptLimit = (
+    limiter: SlidingWindowRateLimiter,
+    endpointName: string
+  ): express.RequestHandler => (req, res, next) => {
+    const decision = limiter.check(`${endpointName}:${getClientKey(req)}`);
+    res.setHeader('X-RateLimit-Limit', String(decision.limit));
+    res.setHeader('X-RateLimit-Remaining', String(decision.remaining));
+    if (!decision.allowed) {
+      res.setHeader('Retry-After', String(decision.resetAfterSeconds));
+      res.status(429).json({
+        error: `Too many ${endpointName} attempts. Please wait and try again.`,
+        code: 'AUTH_RATE_LIMITED',
+        retryAfterSeconds: decision.resetAfterSeconds,
+      });
+      return;
+    }
+    next();
+  };
+
+  const sessionCookieName = 'mindflow_session';
+  const readSessionToken = (req: express.Request): string | null => {
+    const cookieHeader = req.headers.cookie;
+    if (typeof cookieHeader !== 'string') return null;
+    const cookie = cookieHeader
+      .split(';')
+      .map((part) => part.trim())
+      .find((part) => part.startsWith(`${sessionCookieName}=`));
+    return cookie ? cookie.slice(sessionCookieName.length + 1) || null : null;
+  };
+  const writeSessionCookie = (res: express.Response, token: string) => {
+    const secure = isProduction ? '; Secure' : '';
+    res.setHeader(
+      'Set-Cookie',
+      `${sessionCookieName}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${14 * 24 * 60 * 60}${secure}`
+    );
+  };
+  const clearSessionCookie = (res: express.Response) => {
+    const secure = isProduction ? '; Secure' : '';
+    res.setHeader(
+      'Set-Cookie',
+      `${sessionCookieName}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure}`
+    );
+  };
+  const requireAuth: express.RequestHandler = (req, res, next) => {
+    void authStore
+      .getUserForSession(readSessionToken(req))
+      .then((user) => {
+        if (!user) {
+          res.status(401).json({
+            error: 'Sign in to use video analysis and AI study tools.',
+            code: 'AUTH_REQUIRED',
+            retryable: false,
+          });
+          return;
+        }
+        res.locals.mindflowUser = user;
+        next();
+      })
+      .catch(next);
+  };
+
+  const sendAuthError = (res: express.Response, error: unknown) => {
+    if (error instanceof AuthStoreError) {
+      const status = error.code === 'EMAIL_TAKEN' ? 409 : error.code === 'ACCOUNT_LIMIT' ? 503 : 400;
+      res.status(status).json({ error: error.message, code: error.code });
+      return;
+    }
+    res.status(400).json({
+      error: error instanceof Error ? error.message : 'Could not complete account request.',
+      code: 'INVALID_AUTH_INPUT',
+    });
+  };
+
+  app.post(
+    '/api/auth/signup',
+    withAuthAttemptLimit(signupLimiter, 'signup'),
+    express.json({ limit: '16kb' }),
+    async (req, res) => {
+      try {
+        const user = await authStore.register(req.body?.email, req.body?.password);
+        const session = await authStore.createSession(user.id);
+        writeSessionCookie(res, session.token);
+        res.setHeader('Cache-Control', 'no-store');
+        res.status(201).json({
+          user,
+          usage: await authStore.getUsage(user.id, usagePolicy),
+        });
+      } catch (error) {
+        sendAuthError(res, error);
+      }
+    }
+  );
+
+  app.post(
+    '/api/auth/login',
+    withAuthAttemptLimit(loginLimiter, 'login'),
+    express.json({ limit: '16kb' }),
+    async (req, res) => {
+      try {
+        const user = await authStore.authenticate(req.body?.email, req.body?.password);
+        if (!user) {
+          res.status(401).json({
+            error: 'Email or password is incorrect.',
+            code: 'INVALID_CREDENTIALS',
+          });
+          return;
+        }
+        const session = await authStore.createSession(user.id);
+        writeSessionCookie(res, session.token);
+        res.setHeader('Cache-Control', 'no-store');
+        res.json({ user, usage: await authStore.getUsage(user.id, usagePolicy) });
+      } catch (error) {
+        sendAuthError(res, error);
+      }
+    }
+  );
+
+  app.get('/api/auth/me', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    void authStore
+      .getUserForSession(readSessionToken(req))
+      .then(async (user) => {
+        res.json({
+          user,
+          usage: user ? await authStore.getUsage(user.id, usagePolicy) : null,
+        });
+      })
+      .catch(() => res.status(500).json({ error: 'Could not load account status.' }));
+  });
+
+  app.post('/api/auth/logout', express.json({ limit: '2kb' }), async (req, res) => {
+    try {
+      await authStore.destroySession(readSessionToken(req));
+      clearSessionCookie(res);
+      res.setHeader('Cache-Control', 'no-store');
+      res.json({ ok: true });
+    } catch {
+      res.status(500).json({ error: 'Could not sign out right now.' });
+    }
+  });
+
+  const enforceAiUsage = async (
+    req: express.Request,
+    res: express.Response,
+    kind: 'analysis' | 'ai'
+  ): Promise<boolean> => {
+    const user = res.locals.mindflowUser as AuthUser | undefined;
+    if (!user) {
+      res.status(401).json({ error: 'Sign in to continue.', code: 'AUTH_REQUIRED' });
+      return false;
+    }
+    try {
+      const decision = await authStore.consumeUsage(user.id, kind, usagePolicy);
+      if (decision.allowed) {
+        res.setHeader(
+          'X-MindFlow-AI-Actions-Remaining',
+          String(Math.max(0, decision.usage.aiActionLimit - decision.usage.aiActionsUsed))
+        );
+        return true;
+      }
+      const resetAt = Date.parse(decision.usage.resetsAt);
+      const retryAfterSeconds = Math.max(1, Math.ceil((resetAt - Date.now()) / 1000));
+      const messages = {
+        analysis_limit: `Daily video analysis limit reached (${decision.usage.analysisLimit}). Try again after the daily reset.`,
+        user_daily_limit: `Daily AI study limit reached (${decision.usage.aiActionLimit} requests). Try again after the daily reset.`,
+        global_daily_limit: 'MindFlow has reached its shared AI budget for today. Please try again after the daily reset.',
+      };
+      res.setHeader('Retry-After', String(retryAfterSeconds));
+      res.status(429).json({
+        error: decision.reason ? messages[decision.reason] : 'Daily AI limit reached.',
+        code:
+          decision.reason === 'analysis_limit'
+            ? 'ANALYSIS_DAILY_LIMIT'
+            : decision.reason === 'global_daily_limit'
+              ? 'GLOBAL_DAILY_LIMIT'
+              : 'USER_DAILY_LIMIT',
+        retryAfterSeconds,
+        usage: decision.usage,
+      });
+      return false;
+    } catch (error) {
+      console.error(`[MindFlow Auth Error] ${sanitizeLogString(error)}`);
+      res.status(503).json({ error: 'Could not verify daily usage right now.', code: 'AUTH_STORE_UNAVAILABLE' });
+      return false;
+    }
   };
 
   const acquireAiSlot = (
@@ -1328,12 +1633,19 @@ async function startServer() {
     return slot.release;
   };
 
-  /** Lightweight health check (never exposes secrets) */
+  /**
+   * Lightweight health check (never exposes secrets).
+   * Explicitly distinguishes API key configuration from live provider quota availability.
+   */
   app.get('/api/health', (_req, res) => {
     res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    const aiConfigured = Boolean(createGeminiClient());
     res.json({
       status: 'ok',
-      aiConfigured: Boolean(createGeminiClient()),
+      aiConfigured,
+      quotaVerified: false,
+      models: [...FREE_TIER_MODELS],
+      timestamp: new Date().toISOString(),
     });
   });
 
@@ -1345,6 +1657,7 @@ async function startServer() {
    */
   app.post(
     '/api/analyze',
+    requireAuth,
     withRateLimit(rateLimiters.analyze, 'analyze'),
     express.json({ limit: '2mb' }),
     async (req, res) => {
@@ -1416,27 +1729,29 @@ async function startServer() {
         return;
       }
 
+      if (!(await enforceAiUsage(req, res, 'analysis'))) return;
+
       const releaseSlot = acquireAiSlot(req, res);
       if (!releaseSlot) return;
 
-      const clientAbort = new AbortController();
-      req.on('close', () => {
-        if (!res.writableEnded) {
-          clientAbort.abort(new Error('Client connection closed.'));
-        }
-      });
+      const { controller: clientAbort, cleanup: cleanupAbort } =
+        createClientAbortController(res);
 
       try {
-        const result = await inFlight.run(cacheKey, async () => {
-          const hasManualTranscript = Boolean(boundedManualTranscript);
+        const result = await inFlight.run(
+          cacheKey,
+          async (sharedSignal) => {
+            const hasManualTranscript = Boolean(boundedManualTranscript);
 
-          // Layer 1 & Layer 2 in parallel when analyzing by URL
-          const [oembed, ytBundle] = await Promise.all([
-            safeVideoId ? fetchYouTubeOEmbed(safeVideoId) : Promise.resolve<OEmbedInfo>({}),
-            safeVideoId
-              ? fetchYouTubeBundle(safeVideoId)
-              : Promise.resolve<YouTubeExtractedBundle>({ captionSegments: [], chapters: [] }),
-          ]);
+            // Layer 1 & Layer 2 in parallel when analyzing by URL
+            const [oembed, ytBundle] = await Promise.all([
+              safeVideoId
+                ? fetchYouTubeOEmbed(safeVideoId, sharedSignal)
+                : Promise.resolve<OEmbedInfo>({}),
+              safeVideoId
+                ? fetchYouTubeBundle(safeVideoId, sharedSignal)
+                : Promise.resolve<YouTubeExtractedBundle>({ captionSegments: [], chapters: [] }),
+            ]);
 
           // Detect unavailable / private / deleted YouTube videos before spending AI quota
           if (safeVideoId && !hasManualTranscript) {
@@ -1631,7 +1946,9 @@ ${getDomainCheatSheetGuidance(contentDomain)}
               thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM },
             },
           },
-          scaleProfile.timeoutMs
+          scaleProfile.timeoutMs,
+          2,
+          { parentSignal: sharedSignal }
         );
         parsed = extractJsonObject(response.text ?? '');
       } else {
@@ -1644,38 +1961,45 @@ ${getDomainCheatSheetGuidance(contentDomain)}
           totalDurationSeconds <= 600;
 
         if (isConfirmedShortVideo && normalizedUrl) {
+          const mmAbort = createLinkedTimeoutController(
+            10_000,
+            'Multimodal YouTube ingest',
+            sharedSignal
+          );
           try {
-            const mmResponse = await withTimeout(
-              ai.models.generateContent({
-                model: FREE_TIER_MODELS[0],
-                contents: [
-                  {
-                    fileData: {
-                      fileUri: normalizedUrl,
-                      mimeType: 'video/mp4',
-                    },
+            const mmResponse = await ai.models.generateContent({
+              model: FREE_TIER_MODELS[0],
+              contents: [
+                {
+                  fileData: {
+                    fileUri: normalizedUrl,
+                    mimeType: 'video/mp4',
                   },
-                  {
-                    text: promptInstructions,
-                  },
-                ],
-                config: {
-                  responseMimeType: 'application/json',
-                  responseSchema: WORKSPACE_RESPONSE_SCHEMA,
-                  maxOutputTokens: scaleProfile.maxOutputTokens,
-                  thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
                 },
-              }),
-              10000,
-              'Multimodal YouTube ingest'
-            );
+                {
+                  text: promptInstructions,
+                },
+              ],
+              config: {
+                responseMimeType: 'application/json',
+                responseSchema: WORKSPACE_RESPONSE_SCHEMA,
+                maxOutputTokens: scaleProfile.maxOutputTokens,
+                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+                abortSignal: mmAbort.controller.signal,
+              },
+            });
             const candidate = extractJsonObject(mmResponse.text ?? '');
             if (Array.isArray(candidate.nodes) && candidate.nodes.length >= 3) {
               parsed = candidate;
               analysisMode = 'multimodal';
             }
-          } catch {
+          } catch (mmErr) {
+            if (sharedSignal.aborted) {
+              throw sharedSignal.reason ?? mmErr;
+            }
             // Gracefully fall through to Layer 4 Chapters + Search-Grounded Synthesis
+          } finally {
+            mmAbort.cleanup();
           }
         }
 
@@ -1702,10 +2026,15 @@ Provide accurate, end-to-end educational study notes covering the ENTIRE ${total
                   tools: [{ googleSearch: {} }],
                 },
               },
-              18000
+              18000,
+              2,
+              { parentSignal: sharedSignal }
             );
             groundedNotes = (searchResp.text ?? '').trim();
-          } catch {
+          } catch (searchErr) {
+            if (sharedSignal.aborted) {
+              throw sharedSignal.reason ?? searchErr;
+            }
             groundedNotes = ytBundle.description || mergedOembed.title || normalizedUrl;
           }
 
@@ -1721,7 +2050,9 @@ Provide accurate, end-to-end educational study notes covering the ENTIRE ${total
                 thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM },
               },
             },
-            scaleProfile.timeoutMs
+            scaleProfile.timeoutMs,
+            2,
+            { parentSignal: sharedSignal }
           );
           parsed = extractJsonObject(structuredResp.text ?? '');
         }
@@ -1786,7 +2117,9 @@ ${repairSourceContext.slice(0, 75000)}`;
                 thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM },
               },
             },
-            26000
+            26000,
+            2,
+            { parentSignal: sharedSignal }
           );
 
           const repairedParsed = extractJsonObject(repairResp.text ?? '');
@@ -1805,7 +2138,10 @@ ${repairSourceContext.slice(0, 75000)}`;
               qualityReport = candidateReport;
             }
           }
-        } catch {
+        } catch (repairErr) {
+          if (sharedSignal.aborted) {
+            throw sharedSignal.reason ?? repairErr;
+          }
           // Keep the already-normalized workspace cleanly if repair times out or hits quota
         }
       }
@@ -1818,21 +2154,25 @@ ${repairSourceContext.slice(0, 75000)}`;
           };
           analyzeCache.set(cacheKey, payload);
           return payload;
-        });
+        },
+        { signal: clientAbort.signal }
+        );
 
         res.setHeader('X-MindFlow-Cache', 'MISS');
         res.json(result);
       } catch (error) {
         if (error instanceof Error && error.message === 'YOUTUBE_VIDEO_UNAVAILABLE') {
           const reason = (error as Error & { userReason?: string }).userReason;
-          res.status(422).json({
-            error:
-              reason ||
-              'This YouTube video is private, unavailable, or cannot be reached. Paste its transcript to continue.',
-            code: 'VIDEO_UNAVAILABLE',
-            retryable: false,
-            canPasteTranscript: true,
-          });
+          if (!res.headersSent && !res.writableEnded) {
+            res.status(422).json({
+              error:
+                reason ||
+                'This YouTube video is private, unavailable, or cannot be reached. Paste its transcript to continue.',
+              code: 'VIDEO_UNAVAILABLE',
+              retryable: false,
+              canPasteTranscript: true,
+            });
+          }
           return;
         }
         sendClassifiedApiError(
@@ -1843,6 +2183,7 @@ ${repairSourceContext.slice(0, 75000)}`;
           { canPasteTranscript: true }
         );
       } finally {
+        cleanupAbort();
         releaseSlot();
       }
     }
@@ -1854,6 +2195,7 @@ ${repairSourceContext.slice(0, 75000)}`;
    */
   app.post(
     '/api/translate',
+    requireAuth,
     withRateLimit(rateLimiters.translate, 'translate'),
     express.json({ limit: '1mb' }),
     async (req, res) => {
@@ -1890,8 +2232,8 @@ ${repairSourceContext.slice(0, 75000)}`;
       }
 
       const sourceVideoId = sanitizeUserText(workspace.videoId, 64) || 'video';
-      const translateCacheKey = `translate:${sourceVideoId}:${targetLanguage}:${hashCacheKey(
-        String(workspace.title ?? '') + ':' + String(workspace.nodes.length) + ':' + String(workspace.language ?? '')
+      const translateCacheKey = `translate:${sourceVideoId}:${targetLanguage}:${computeWorkspaceContentFingerprint(
+        workspace
       )}`;
       const cached = translateCache.get(translateCacheKey);
       if (cached) {
@@ -1900,31 +2242,31 @@ ${repairSourceContext.slice(0, 75000)}`;
         return;
       }
 
+      if (!(await enforceAiUsage(req, res, 'ai'))) return;
+
       const releaseSlot = acquireAiSlot(req, res);
       if (!releaseSlot) return;
 
-      const clientAbort = new AbortController();
-      req.on('close', () => {
-        if (!res.writableEnded) {
-          clientAbort.abort(new Error('Client connection closed.'));
-        }
-      });
+      const { controller: clientAbort, cleanup: cleanupAbort } =
+        createClientAbortController(res);
 
       try {
-        const result = await inFlight.run(translateCacheKey, async () => {
-          const existingDur =
-            typeof workspace.videoDurationSeconds === 'number'
-              ? workspace.videoDurationSeconds
-              : parseTimestampToSeconds(String(workspace.durationLabel ?? ''));
-          const translateProfile = getDurationScaleProfile(existingDur > 0 ? existingDur : undefined);
-          const existingCoverage =
-            workspace.coverageMode === 'full-transcript' ||
-            workspace.coverageMode === 'timeline-sampled' ||
-            workspace.coverageMode === 'chapters-metadata'
-              ? workspace.coverageMode
-              : undefined;
+        const result = await inFlight.run(
+          translateCacheKey,
+          async (sharedSignal) => {
+            const existingDur =
+              typeof workspace.videoDurationSeconds === 'number'
+                ? workspace.videoDurationSeconds
+                : parseTimestampToSeconds(String(workspace.durationLabel ?? ''));
+            const translateProfile = getDurationScaleProfile(existingDur > 0 ? existingDur : undefined);
+            const existingCoverage =
+              workspace.coverageMode === 'full-transcript' ||
+              workspace.coverageMode === 'timeline-sampled' ||
+              workspace.coverageMode === 'chapters-metadata'
+                ? workspace.coverageMode
+                : undefined;
 
-          const prompt = `Translate the following MindFlow AI educational JSON workspace into the target language.
+            const prompt = `Translate the following MindFlow AI educational JSON workspace into the target language.
 ${getLanguageInstruction(targetLanguage)}
 
 STRICT RULES:
@@ -1937,42 +2279,46 @@ STRICT RULES:
 SOURCE JSON:
 ${JSON.stringify(workspace)}`;
 
-          const response = await generateWithFreeTierFallback(
-            ai,
-            {
-              contents: prompt,
-              config: {
-                responseMimeType: 'application/json',
-                responseSchema: WORKSPACE_RESPONSE_SCHEMA,
-                maxOutputTokens: translateProfile.maxOutputTokens,
-                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            const response = await generateWithFreeTierFallback(
+              ai,
+              {
+                contents: prompt,
+                config: {
+                  responseMimeType: 'application/json',
+                  responseSchema: WORKSPACE_RESPONSE_SCHEMA,
+                  maxOutputTokens: translateProfile.maxOutputTokens,
+                  thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+                },
               },
-            },
-            translateProfile.timeoutMs
-          );
+              translateProfile.timeoutMs,
+              2,
+              { parentSignal: sharedSignal }
+            );
 
-          const parsed = extractJsonObject(response.text ?? '{}');
-          const existingSourceType: 'youtube' | 'manual-transcript' =
-            workspace.sourceType === 'manual-transcript' || !isValidYouTubeId(sourceVideoId)
-              ? 'manual-transcript'
-              : 'youtube';
-          const translated = sanitizeWorkspace(parsed, {
-            videoId: sourceVideoId,
-            youtubeUrl: existingSourceType === 'youtube' ? String(workspace.youtubeUrl ?? '') : '',
-            sourceType: existingSourceType,
-            language: targetLanguage,
-            oembed: {
-              title: String(workspace.title ?? ''),
-              authorName: String(workspace.channel ?? ''),
-            },
-            videoDurationSeconds: existingDur > 0 ? existingDur : undefined,
-            coverageMode: existingCoverage,
-          });
+            const parsed = extractJsonObject(response.text ?? '{}');
+            const existingSourceType: 'youtube' | 'manual-transcript' =
+              workspace.sourceType === 'manual-transcript' || !isValidYouTubeId(sourceVideoId)
+                ? 'manual-transcript'
+                : 'youtube';
+            const translated = sanitizeWorkspace(parsed, {
+              videoId: sourceVideoId,
+              youtubeUrl: existingSourceType === 'youtube' ? String(workspace.youtubeUrl ?? '') : '',
+              sourceType: existingSourceType,
+              language: targetLanguage,
+              oembed: {
+                title: String(workspace.title ?? ''),
+                authorName: String(workspace.channel ?? ''),
+              },
+              videoDurationSeconds: existingDur > 0 ? existingDur : undefined,
+              coverageMode: existingCoverage,
+            });
 
-          const payload = { workspace: translated };
-          translateCache.set(translateCacheKey, payload);
-          return payload;
-        });
+            const payload = { workspace: translated };
+            translateCache.set(translateCacheKey, payload);
+            return payload;
+          },
+          { signal: clientAbort.signal }
+        );
 
         res.setHeader('X-MindFlow-Cache', 'MISS');
         res.json(result);
@@ -1984,6 +2330,7 @@ ${JSON.stringify(workspace)}`;
           'translate'
         );
       } finally {
+        cleanupAbort();
         releaseSlot();
       }
     }
@@ -2017,6 +2364,7 @@ ${JSON.stringify(workspace)}`;
    */
   app.post(
     '/api/simplify',
+    requireAuth,
     withRateLimit(rateLimiters.simplify, 'simplify'),
     express.json({ limit: '128kb' }),
     async (req, res) => {
@@ -2076,38 +2424,38 @@ ${JSON.stringify(workspace)}`;
         return;
       }
 
+      if (!(await enforceAiUsage(req, res, 'ai'))) return;
+
       const releaseSlot = acquireAiSlot(req, res);
       if (!releaseSlot) return;
 
-      const clientAbort = new AbortController();
-      req.on('close', () => {
-        if (!res.writableEnded) {
-          clientAbort.abort(new Error('Client connection closed.'));
-        }
-      });
+      const { controller: clientAbort, cleanup: cleanupAbort } =
+        createClientAbortController(res);
 
       try {
-        const result = await inFlight.run(simplifyKey, async () => {
-          const context = Array.isArray(keyPoints)
-            ? keyPoints
-                .slice(0, 5)
-                .map(
-                  (kp) =>
-                    `${sanitizeUserText(kp.keyword, 80)}: ${sanitizeUserText(kp.detail, 260)}`
-                )
-                .join('\n- ')
-            : '';
+        const result = await inFlight.run(
+          simplifyKey,
+          async (sharedSignal) => {
+            const context = Array.isArray(keyPoints)
+              ? keyPoints
+                  .slice(0, 5)
+                  .map(
+                    (kp) =>
+                      `${sanitizeUserText(kp.keyword, 80)}: ${sanitizeUserText(kp.detail, 260)}`
+                  )
+                  .join('\n- ')
+              : '';
 
-          const prompt = `You are an expert university tutor explaining a concept clearly to a bright beginner who wants genuine understanding without jargon or condescension.
+            const prompt = `You are an expert university tutor explaining a concept clearly to a bright beginner who wants genuine understanding without jargon or condescension.
 
 ${getLanguageInstruction(safeLang)}
 
 CONCEPT TO SIMPLIFY: "${cleanNodeTitle}"
 VIDEO CONTEXT: "${cleanVideoTitle}"${cleanSubtitle ? `\nSUBTITLE: ${cleanSubtitle}` : ''}${
-            context ? `\nKEY NOTES FROM VIDEO:\n- ${context}` : ''
-          }${cleanExample ? `\nEXISTING VIDEO EXAMPLE: ${cleanExample}` : ''}${
-            cleanExcerpt ? `\nNEAREST VIDEO EXCERPT:\n${cleanExcerpt}` : ''
-          }
+              context ? `\nKEY NOTES FROM VIDEO:\n- ${context}` : ''
+            }${cleanExample ? `\nEXISTING VIDEO EXAMPLE: ${cleanExample}` : ''}${
+              cleanExcerpt ? `\nNEAREST VIDEO EXCERPT:\n${cleanExcerpt}` : ''
+            }
 
 REQUIREMENTS (Return valid JSON with all 5 fields):
 1. "simpleDefinition": A crisp 1-sentence plain-language definition accurately stating what this concept is.
@@ -2117,37 +2465,41 @@ REQUIREMENTS (Return valid JSON with all 5 fields):
 5. "oneLineTakeaway": One memorable, exam-ready sentence summarizing the core takeaway.
 Never invent technical claims that contradict the video notes.`;
 
-          const response = await generateWithFreeTierFallback(
-            ai,
-            {
-              contents: prompt,
-              config: {
-                responseMimeType: 'application/json',
-                responseSchema: SIMPLIFY_RESPONSE_SCHEMA,
-                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            const response = await generateWithFreeTierFallback(
+              ai,
+              {
+                contents: prompt,
+                config: {
+                  responseMimeType: 'application/json',
+                  responseSchema: SIMPLIFY_RESPONSE_SCHEMA,
+                  thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+                },
               },
-            },
-            20_000
-          );
+              20_000,
+              2,
+              { parentSignal: sharedSignal }
+            );
 
-          const rawText = (response.text ?? '').trim();
-          let payload: Record<string, unknown>;
-          try {
-            const parsedRaw = extractJsonObject(rawText);
-            const structured = parseStructuredSimplification(parsedRaw);
-            payload = structured
-              ? { structured, analogy: formatStructuredSimplification(structured) }
-              : { analogy: rawText, structured: null };
-          } catch {
-            if (!rawText) {
-              throw new Error('Empty JSON response.');
+            const rawText = (response.text ?? '').trim();
+            let payload: Record<string, unknown>;
+            try {
+              const parsedRaw = extractJsonObject(rawText);
+              const structured = parseStructuredSimplification(parsedRaw);
+              payload = structured
+                ? { structured, analogy: formatStructuredSimplification(structured) }
+                : { analogy: rawText, structured: null };
+            } catch {
+              if (!rawText) {
+                throw new Error('Empty JSON response.');
+              }
+              payload = { analogy: rawText, structured: null };
             }
-            payload = { analogy: rawText, structured: null };
-          }
 
-          simplifyCache.set(simplifyKey, payload);
-          return payload;
-        });
+            simplifyCache.set(simplifyKey, payload);
+            return payload;
+          },
+          { signal: clientAbort.signal }
+        );
 
         res.setHeader('X-MindFlow-Cache', 'MISS');
         res.json(result);
@@ -2159,6 +2511,7 @@ Never invent technical claims that contradict the video notes.`;
           'simplify'
         );
       } finally {
+        cleanupAbort();
         releaseSlot();
       }
     }
@@ -2170,6 +2523,7 @@ Never invent technical claims that contradict the video notes.`;
    */
   app.post(
     '/api/grounding/node',
+    requireAuth,
     withRateLimit(rateLimiters.grounding, 'grounding'),
     express.json({ limit: '128kb' }),
     async (req, res) => {
@@ -2204,86 +2558,90 @@ Never invent technical claims that contradict the video notes.`;
         return;
       }
 
+      if (!(await enforceAiUsage(req, res, 'ai'))) return;
+
       const releaseSlot = acquireAiSlot(req, res);
       if (!releaseSlot) return;
 
-      const clientAbort = new AbortController();
-      req.on('close', () => {
-        if (!res.writableEnded) {
-          clientAbort.abort(new Error('Client connection closed.'));
-        }
-      });
+      const { controller: clientAbort, cleanup: cleanupAbort } =
+        createClientAbortController(res);
 
       try {
-        const result = await inFlight.run(groundingKey, async () => {
-          const pointContext = Array.isArray(keyPoints)
-            ? keyPoints
-                .slice(0, 4)
-                .map(
-                  (p: { keyword?: string; detail?: string }) =>
-                    `${sanitizeUserText(p.keyword, 80)}: ${sanitizeUserText(p.detail, 220)}`
-                )
-                .join('; ')
-            : '';
+        const result = await inFlight.run(
+          groundingKey,
+          async (sharedSignal) => {
+            const pointContext = Array.isArray(keyPoints)
+              ? keyPoints
+                  .slice(0, 4)
+                  .map(
+                    (p: { keyword?: string; detail?: string }) =>
+                      `${sanitizeUserText(p.keyword, 80)}: ${sanitizeUserText(p.detail, 220)}`
+                  )
+                  .join('; ')
+              : '';
 
-          const prompt = [
-            `You are a concise study assistant for MindFlow AI.`,
-            `Video topic: "${cleanLectureTitle}".`,
-            `Selected mindmap node: "${cleanNodeTitle}".`,
-            pointContext ? `Existing notes: ${pointContext}` : '',
-            `Use Google Search to gather up-to-date, accurate real-world context or recent facts for "${cleanNodeTitle}".`,
-            `Respond cleanly in this exact format:`,
-            `SUMMARY: <2 crisp sentences>`,
-            `- <highlight 1>`,
-            `- <highlight 2>`,
-            `- <highlight 3>`,
-          ]
-            .filter(Boolean)
-            .join('\n');
+            const prompt = [
+              `You are a concise study assistant for MindFlow AI.`,
+              `Video topic: "${cleanLectureTitle}".`,
+              `Selected mindmap node: "${cleanNodeTitle}".`,
+              pointContext ? `Existing notes: ${pointContext}` : '',
+              `Use Google Search to gather up-to-date, accurate real-world context or recent facts for "${cleanNodeTitle}".`,
+              `Respond cleanly in this exact format:`,
+              `SUMMARY: <2 crisp sentences>`,
+              `- <highlight 1>`,
+              `- <highlight 2>`,
+              `- <highlight 3>`,
+            ]
+              .filter(Boolean)
+              .join('\n');
 
-          const response = await generateWithFreeTierFallback(
-            ai,
-            {
-              contents: prompt,
-              config: {
-                tools: [{ googleSearch: {} }],
+            const response = await generateWithFreeTierFallback(
+              ai,
+              {
+                contents: prompt,
+                config: {
+                  tools: [{ googleSearch: {} }],
+                },
               },
-            },
-            22_000
-          );
+              22_000,
+              2,
+              { parentSignal: sharedSignal }
+            );
 
-          const rawText = (response.text ?? '').trim();
-          const lines = rawText
-            .split('\n')
-            .map((l) => l.trim())
-            .filter(Boolean);
+            const rawText = (response.text ?? '').trim();
+            const lines = rawText
+              .split('\n')
+              .map((l) => l.trim())
+              .filter(Boolean);
 
-          let summary = '';
-          const highlights: string[] = [];
+            let summary = '';
+            const highlights: string[] = [];
 
-          for (const line of lines) {
-            if (line.toUpperCase().startsWith('SUMMARY:')) {
-              summary = line.slice(8).trim();
-            } else if (line.startsWith('- ') || line.startsWith('* ')) {
-              highlights.push(line.slice(2).trim());
-            } else if (!summary) {
-              summary = line;
+            for (const line of lines) {
+              if (line.toUpperCase().startsWith('SUMMARY:')) {
+                summary = line.slice(8).trim();
+              } else if (line.startsWith('- ') || line.startsWith('* ')) {
+                highlights.push(line.slice(2).trim());
+              } else if (!summary) {
+                summary = line;
+              }
             }
-          }
 
-          const chunks = response.candidates?.[0]?.groundingMetadata
-            ?.groundingChunks as RawGroundingChunk[] | undefined;
-          const sources = extractGroundingSources(chunks);
+            const chunks = response.candidates?.[0]?.groundingMetadata
+              ?.groundingChunks as RawGroundingChunk[] | undefined;
+            const sources = extractGroundingSources(chunks);
 
-          const payload = {
-            summary: summary || rawText.slice(0, 280),
-            highlights: highlights.slice(0, 4),
-            sources,
-            fetchedAt: new Date().toISOString(),
-          };
-          groundingCache.set(groundingKey, payload);
-          return payload;
-        });
+            const payload = {
+              summary: summary || rawText.slice(0, 280),
+              highlights: highlights.slice(0, 4),
+              sources,
+              fetchedAt: new Date().toISOString(),
+            };
+            groundingCache.set(groundingKey, payload);
+            return payload;
+          },
+          { signal: clientAbort.signal }
+        );
 
         res.setHeader('X-MindFlow-Cache', 'MISS');
         res.json(result);
@@ -2295,6 +2653,7 @@ Never invent technical claims that contradict the video notes.`;
           'grounding'
         );
       } finally {
+        cleanupAbort();
         releaseSlot();
       }
     }
@@ -2307,7 +2666,7 @@ Never invent technical claims that contradict the video notes.`;
    */
   app.get(
     '/api/image-proxy',
-    withRateLimit(rateLimiters.imageProxy, 'image-proxy'),
+    withRateLimit(rateLimiters.imageProxy, 'image-proxy', false),
     async (req, res) => {
       const rawUrl = typeof req.query.url === 'string' ? req.query.url.trim() : '';
       if (!rawUrl || !isAllowedRemoteImageUrl(rawUrl)) {
@@ -2319,8 +2678,13 @@ Never invent technical claims that contradict the video notes.`;
         return;
       }
 
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 6000);
+      const { controller: clientAbort, cleanup: cleanupClientAbort } =
+        createClientAbortController(res);
+      const { controller, cleanup: cleanupTimeout } = createLinkedTimeoutController(
+        6000,
+        'Image proxy fetch',
+        clientAbort.signal
+      );
 
       try {
         let currentUrl = rawUrl;
@@ -2393,6 +2757,7 @@ Never invent technical claims that contradict the video notes.`;
         res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox");
         res.send(buffer);
       } catch (error) {
+        if (res.headersSent || res.writableEnded || res.destroyed) return;
         if (error instanceof Error && error.message === 'RESPONSE_TOO_LARGE') {
           res.status(413).json({
             error: 'Image exceeds 5MB limit.',
@@ -2403,7 +2768,8 @@ Never invent technical claims that contradict the video notes.`;
         }
         res.status(502).end();
       } finally {
-        clearTimeout(timeout);
+        cleanupTimeout();
+        cleanupClientAbort();
       }
     }
   );
@@ -2486,13 +2852,17 @@ Never invent technical claims that contradict the video notes.`;
   };
 
   async function fetchWikipediaThumbnail(
-    query: string
+    query: string,
+    parentSignal?: AbortSignal
   ): Promise<{ url?: string; caption?: string }> {
     const cleanQuery = query.trim().replace(/\s+/g, ' ').slice(0, 60);
     if (!cleanQuery) return {};
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 3500);
+    const { controller, cleanup } = createLinkedTimeoutController(
+      3500,
+      'Wikipedia thumbnail',
+      parentSignal
+    );
 
     try {
       const endpoint = `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(
@@ -2500,6 +2870,7 @@ Never invent technical claims that contradict the video notes.`;
       )}`;
       const resp = await fetch(endpoint, {
         signal: controller.signal,
+        redirect: 'manual',
         headers: {
           Accept: 'application/json',
           'User-Agent': 'MindFlowAI/1.0 (https://mindflow.app; educational-study-app)',
@@ -2521,7 +2892,7 @@ Never invent technical claims that contradict the video notes.`;
     } catch {
       return {};
     } finally {
-      clearTimeout(timeout);
+      cleanup();
     }
   }
 
@@ -2532,6 +2903,7 @@ Never invent technical claims that contradict the video notes.`;
    */
   app.post(
     '/api/generate-visual-guide',
+    requireAuth,
     withRateLimit(rateLimiters.visualGuide, 'visual-guide'),
     express.json({ limit: '1mb' }),
     async (req, res) => {
@@ -2540,17 +2912,20 @@ Never invent technical claims that contradict the video notes.`;
         analysisData,
         language = 'en',
         guideLength = 'long',
+        includeDiagrams = true,
       } = (req.body ?? {}) as {
         videoId?: string;
         analysisData?: Record<string, unknown>;
         language?: LanguageCode;
         guideLength?: 'standard' | 'long';
+        includeDiagrams?: boolean;
       };
 
       const safeVideoId = typeof videoId === 'string' ? videoId.trim() : '';
       const safeLang: LanguageCode =
         language === 'hi' || language === 'hinglish' ? language : 'en';
       const isLong = guideLength !== 'standard';
+      const allowDiagrams = includeDiagrams !== false;
 
       if (!analysisData || typeof analysisData !== 'object') {
         res.status(400).json({
@@ -2572,16 +2947,8 @@ Never invent technical claims that contradict the video notes.`;
       }
 
       const hasValidYtId = isValidYouTubeId(safeVideoId);
-      const contentFingerprint = hasValidYtId
-        ? safeVideoId
-        : hashCacheKey(
-            `${String(analysisData.title ?? '')}|${String(analysisData.videoId ?? '')}|${JSON.stringify(
-              Array.isArray(analysisData.nodes)
-                ? (analysisData.nodes as Array<Record<string, unknown>>).map((n) => n?.title ?? '')
-                : ''
-            )}`
-          );
-      const guideCacheKey = `vguide:${contentFingerprint}:${safeLang}:${isLong ? 'long' : 'standard'}`;
+      const contentFingerprint = computeWorkspaceContentFingerprint(analysisData);
+      const guideCacheKey = `vguide:${hasValidYtId ? safeVideoId : 'manual'}:${contentFingerprint}:${safeLang}:${isLong ? 'long' : 'standard'}:${allowDiagrams ? 'diag1' : 'diag0'}`;
       const cachedGuide = visualGuideCache.get(guideCacheKey);
       if (cachedGuide) {
         res.setHeader('X-MindFlow-Cache', 'HIT');
@@ -2589,29 +2956,34 @@ Never invent technical claims that contradict the video notes.`;
         return;
       }
 
+      if (!(await enforceAiUsage(req, res, 'ai'))) return;
+
       const releaseSlot = acquireAiSlot(req, res);
       if (!releaseSlot) return;
 
-      const clientAbort = new AbortController();
-      req.on('close', () => {
-        if (!res.writableEnded) {
-          clientAbort.abort(new Error('Client connection closed.'));
-        }
-      });
+      const { controller: clientAbort, cleanup: cleanupAbort } =
+        createClientAbortController(res);
 
       try {
-        const result = await inFlight.run(guideCacheKey, async () => {
-          const guideMaxDuration =
-            typeof analysisData.videoDurationSeconds === 'number' &&
-            analysisData.videoDurationSeconds > 0
-              ? analysisData.videoDurationSeconds
-              : undefined;
+        const result = await inFlight.run(
+          guideCacheKey,
+          async (sharedSignal) => {
+            const guideMaxDuration =
+              typeof analysisData.videoDurationSeconds === 'number' &&
+              analysisData.videoDurationSeconds > 0
+                ? analysisData.videoDurationSeconds
+                : undefined;
 
-      const visualGuideContext = buildVisualGuideContext(analysisData, {
-        maxChars: 24000,
-      });
+            const visualGuideContext = buildVisualGuideContext(analysisData, {
+              maxChars: 24000,
+            });
 
-      const prompt = `You are an expert educational textbook author & instructional designer creating a structured, genuinely useful Visual PDF Study Guide from a YouTube video so a student can thoroughly study and revise the ENTIRE topic.
+            const diagramPromptRule = allowDiagrams
+              ? `   - "includeDiagram" & "svgDiagram": Set "includeDiagram": true ONLY when a visual diagram (flowchart, hierarchy, comparison, architecture, or step sequence) genuinely helps explain this chapter's concept; set "includeDiagram": false and "svgDiagram": "" for purely narrative/introductory chapters so there are zero filler diagrams.
+     When "includeDiagram" is true, output a clean, meaningful inline <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 220" width="100%"> using dark slate background #0b1120, rounded nodes (#131c35), crisp arrows/connectors, high-contrast labels (#f8fafc / #cbd5e1), and accent strokes (#8b5cf6, #22d3ee, #10b981, #818cf8) that our renderer automatically adapts to Obsidian, Warm, and Blueprint themes. NEVER include height="auto", <script>, <style>, <foreignObject>, or external images.`
+              : `   - "includeDiagram" & "svgDiagram": Diagrams are explicitly DISABLED by the user for this guide. Set "includeDiagram": false and "svgDiagram": "" on EVERY chapter.`;
+
+            const prompt = `You are an expert educational textbook author & instructional designer creating a structured, genuinely useful Visual PDF Study Guide from a YouTube video so a student can thoroughly study and revise the ENTIRE topic.
 
 ${getLanguageInstruction(safeLang)}
 
@@ -2636,138 +3008,140 @@ EDUCATIONAL QUALITY & DESIGN RULES (${isLong ? 'COMPREHENSIVE MULTI-PAGE EDITION
    - "insightLabel": Short badge label (e.g., "Key Distinction", "Mental Model", "Exam Tip", "Worked Application").
    - "extraAiInsight": Helpful memory model, common pitfall warning, or clarifying connection (2 crisp sentences; if adding a supplementary analogy beyond the video, keep it accurate and clearly framed).
    - "webImageQuery": ONLY provide a 2–3 word ENGLISH Wikipedia phrase if a concrete scientific, anatomical, historical, or technical photo genuinely improves understanding; otherwise return an empty string "" (NEVER request irrelevant decorative images).
-   - "includeDiagram" & "svgDiagram": Set "includeDiagram": true ONLY when a visual diagram (flowchart, hierarchy, comparison, architecture, or step sequence) genuinely helps explain this chapter's concept; set "includeDiagram": false and "svgDiagram": "" for purely narrative/introductory chapters so there are zero filler diagrams.
-     When "includeDiagram" is true, output a clean, meaningful inline <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 220" width="100%"> using dark slate background #0b1120, rounded nodes (#131c35), crisp arrows/connectors, high-contrast labels (#f8fafc / #cbd5e1), and accent strokes (#8b5cf6, #22d3ee, #10b981, #818cf8) that our renderer automatically adapts to Obsidian, Warm, and Blueprint themes. NEVER include height="auto", <script>, <style>, <foreignObject>, or external images.
+${diagramPromptRule}
 3. "quickRecall":
    - "terms": ${isLong ? '8 to 10' : '5 to 6'} essential terms/formulas/rules with accurate "definition" and practical "note".
    - "checklist": ${isLong ? '6 to 8' : '5'} focused active-recall revision questions/checkpoints covering early through late chapters.`;
 
-      const response = await generateWithFreeTierFallback(
-        ai,
-        {
-          contents: prompt,
-          config: {
-            responseMimeType: 'application/json',
-            responseSchema: VISUAL_GUIDE_RESPONSE_SCHEMA,
-            maxOutputTokens: 16384,
-            thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM },
+            const response = await generateWithFreeTierFallback(
+              ai,
+              {
+                contents: prompt,
+                config: {
+                  responseMimeType: 'application/json',
+                  responseSchema: VISUAL_GUIDE_RESPONSE_SCHEMA,
+                  maxOutputTokens: 16384,
+                  thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM },
+                },
+              },
+              36000,
+              2,
+              { parentSignal: sharedSignal }
+            );
+
+            const parsed = extractJsonObject(response.text ?? '');
+            const rawChapters = Array.isArray(parsed.chapters) ? parsed.chapters : [];
+            const frameCycle: Array<'1' | '2' | '3' | 'maxresdefault' | 'hqdefault'> = [
+              '1',
+              '2',
+              '3',
+              'maxresdefault',
+              'hqdefault',
+            ];
+
+            // Enrich chapters in parallel with conditional Wikipedia thumbnails + YouTube frames + strict SVG sanitization
+            const chapters = await Promise.all(
+              rawChapters.slice(0, isLong ? 8 : 6).map(async (ch: Record<string, unknown>, idx: number) => {
+                const query = typeof ch.webImageQuery === 'string' ? ch.webImageQuery.trim() : '';
+                const wiki =
+                  query.length >= 3 ? await fetchWikipediaThumbnail(query, sharedSignal) : {};
+                const accent = VALID_ACCENTS.has(String(ch.accent))
+                  ? (String(ch.accent) as 'violet' | 'cyan' | 'emerald' | 'indigo')
+                  : ACCENT_CYCLE[idx % ACCENT_CYCLE.length];
+                const heading = String(ch.heading ?? `Chapter ${idx + 1}`);
+                const keyTerms = Array.isArray(ch.keyTerms)
+                  ? ch.keyTerms.slice(0, 6).map(String)
+                  : [];
+                const chapterIncludesDiagram = allowDiagrams && ch.includeDiagram === true;
+
+                const normTs = normalizeTimestampPair(
+                  ch.timestampSeconds,
+                  ch.timestamp,
+                  guideMaxDuration
+                );
+
+                const practicalExample =
+                  typeof ch.practicalExample === 'string' && ch.practicalExample.trim()
+                    ? ch.practicalExample.trim()
+                    : undefined;
+                const chapterSummary =
+                  typeof ch.chapterSummary === 'string' && ch.chapterSummary.trim()
+                    ? ch.chapterSummary.trim()
+                    : undefined;
+
+                return {
+                  id:
+                    typeof ch.id === 'string' && ch.id.trim()
+                      ? ch.id.trim()
+                      : `vg-ch-${idx + 1}`,
+                  timestamp: normTs.label,
+                  timestampSeconds: normTs.seconds,
+                  heading,
+                  accent,
+                  videoExplanation: Array.isArray(ch.videoExplanation)
+                    ? ch.videoExplanation.slice(0, 4).map(String)
+                    : [String(ch.videoExplanation ?? '')],
+                  keyTerms,
+                  ...(practicalExample ? { practicalExample } : {}),
+                  ...(chapterSummary ? { chapterSummary } : {}),
+                  insightLabel: String(ch.insightLabel ?? 'Key Insight'),
+                  extraAiInsight: String(ch.extraAiInsight ?? ''),
+                  webImageQuery: query,
+                  webImageUrl: wiki.url,
+                  webImageCaption: wiki.caption,
+                  videoFrameUrl: hasValidYtId
+                    ? buildYouTubeFrameUrl(safeVideoId, frameCycle[idx % frameCycle.length])
+                    : undefined,
+                  svgDiagram: sanitizeOptionalSvgDiagram(
+                    typeof ch.svgDiagram === 'string' ? ch.svgDiagram : undefined,
+                    chapterIncludesDiagram,
+                    heading,
+                    keyTerms
+                  ),
+                };
+              })
+            );
+
+            const quickRaw = (parsed.quickRecall ?? {}) as Record<string, unknown>;
+            const guide = {
+              id: `vguide-${safeVideoId || 'video'}-${safeLang}`,
+              videoId: safeVideoId || String(analysisData.videoId ?? 'video'),
+              language: safeLang,
+              title: String(parsed.title || analysisData.title || 'Visual Study Guide'),
+              subtitle: String(
+                parsed.subtitle || 'Comprehensive long-form notes, vector diagrams & rapid recall sheet'
+              ),
+              channel: String(analysisData.channel ?? 'YouTube Creator'),
+              category: String(parsed.category || analysisData.videoCategory || 'Explainer'),
+              estimatedReadTime: String(parsed.estimatedReadTime || (isLong ? '8 min' : '4 min')),
+              heroTakeaways: Array.isArray(parsed.heroTakeaways)
+                ? parsed.heroTakeaways.slice(0, 5).map(String)
+                : [],
+              coverFrameUrl: hasValidYtId
+                ? buildYouTubeFrameUrl(safeVideoId, 'maxresdefault')
+                : '',
+              chapters,
+              quickRecall: {
+                terms: Array.isArray(quickRaw.terms)
+                  ? quickRaw.terms.slice(0, 12).map((t: Record<string, unknown>) => ({
+                      term: String(t.term ?? ''),
+                      definition: String(t.definition ?? ''),
+                      note: String(t.note ?? ''),
+                    }))
+                  : [],
+                checklist: Array.isArray(quickRaw.checklist)
+                  ? quickRaw.checklist.slice(0, 8).map(String)
+                  : [],
+              },
+              generatedAt: new Date().toISOString(),
+            };
+
+            const payload = { guide };
+            visualGuideCache.set(guideCacheKey, payload);
+            return payload;
           },
-        },
-        36000,
-        2,
-        { parentSignal: clientAbort.signal }
-      );
-
-      const parsed = extractJsonObject(response.text ?? '');
-      const rawChapters = Array.isArray(parsed.chapters) ? parsed.chapters : [];
-      const frameCycle: Array<'1' | '2' | '3' | 'maxresdefault' | 'hqdefault'> = [
-        '1',
-        '2',
-        '3',
-        'maxresdefault',
-        'hqdefault',
-      ];
-
-      // Enrich chapters in parallel with conditional Wikipedia thumbnails + YouTube frames + strict SVG sanitization
-      const chapters = await Promise.all(
-        rawChapters.slice(0, isLong ? 8 : 6).map(async (ch: Record<string, unknown>, idx: number) => {
-          const query = typeof ch.webImageQuery === 'string' ? ch.webImageQuery.trim() : '';
-          const wiki = query.length >= 3 ? await fetchWikipediaThumbnail(query) : {};
-          const accent = VALID_ACCENTS.has(String(ch.accent))
-            ? (String(ch.accent) as 'violet' | 'cyan' | 'emerald' | 'indigo')
-            : ACCENT_CYCLE[idx % ACCENT_CYCLE.length];
-          const heading = String(ch.heading ?? `Chapter ${idx + 1}`);
-          const keyTerms = Array.isArray(ch.keyTerms)
-            ? ch.keyTerms.slice(0, 6).map(String)
-            : [];
-          const includeDiagram = ch.includeDiagram === true;
-
-          const normTs = normalizeTimestampPair(
-            ch.timestampSeconds,
-            ch.timestamp,
-            guideMaxDuration
-          );
-
-          const practicalExample =
-            typeof ch.practicalExample === 'string' && ch.practicalExample.trim()
-              ? ch.practicalExample.trim()
-              : undefined;
-          const chapterSummary =
-            typeof ch.chapterSummary === 'string' && ch.chapterSummary.trim()
-              ? ch.chapterSummary.trim()
-              : undefined;
-
-          return {
-            id:
-              typeof ch.id === 'string' && ch.id.trim()
-                ? ch.id.trim()
-                : `vg-ch-${idx + 1}`,
-            timestamp: normTs.label,
-            timestampSeconds: normTs.seconds,
-            heading,
-            accent,
-            videoExplanation: Array.isArray(ch.videoExplanation)
-              ? ch.videoExplanation.slice(0, 4).map(String)
-              : [String(ch.videoExplanation ?? '')],
-            keyTerms,
-            ...(practicalExample ? { practicalExample } : {}),
-            ...(chapterSummary ? { chapterSummary } : {}),
-            insightLabel: String(ch.insightLabel ?? 'Key Insight'),
-            extraAiInsight: String(ch.extraAiInsight ?? ''),
-            webImageQuery: query,
-            webImageUrl: wiki.url,
-            webImageCaption: wiki.caption,
-            videoFrameUrl: hasValidYtId
-              ? buildYouTubeFrameUrl(safeVideoId, frameCycle[idx % frameCycle.length])
-              : undefined,
-            svgDiagram: sanitizeOptionalSvgDiagram(
-              typeof ch.svgDiagram === 'string' ? ch.svgDiagram : undefined,
-              includeDiagram,
-              heading,
-              keyTerms
-            ),
-          };
-        })
-      );
-
-      const quickRaw = (parsed.quickRecall ?? {}) as Record<string, unknown>;
-      const guide = {
-        id: `vguide-${safeVideoId || 'video'}-${safeLang}`,
-        videoId: safeVideoId || String(analysisData.videoId ?? 'video'),
-        language: safeLang,
-        title: String(parsed.title || analysisData.title || 'Visual Study Guide'),
-        subtitle: String(
-          parsed.subtitle || 'Comprehensive long-form notes, vector diagrams & rapid recall sheet'
-        ),
-        channel: String(analysisData.channel ?? 'YouTube Creator'),
-        category: String(parsed.category || analysisData.videoCategory || 'Explainer'),
-        estimatedReadTime: String(parsed.estimatedReadTime || (isLong ? '8 min' : '4 min')),
-        heroTakeaways: Array.isArray(parsed.heroTakeaways)
-          ? parsed.heroTakeaways.slice(0, 5).map(String)
-          : [],
-        coverFrameUrl: hasValidYtId
-          ? buildYouTubeFrameUrl(safeVideoId, 'maxresdefault')
-          : '',
-        chapters,
-        quickRecall: {
-          terms: Array.isArray(quickRaw.terms)
-            ? quickRaw.terms.slice(0, 12).map((t: Record<string, unknown>) => ({
-                term: String(t.term ?? ''),
-                definition: String(t.definition ?? ''),
-                note: String(t.note ?? ''),
-              }))
-            : [],
-          checklist: Array.isArray(quickRaw.checklist)
-            ? quickRaw.checklist.slice(0, 8).map(String)
-            : [],
-        },
-        generatedAt: new Date().toISOString(),
-      };
-
-          const payload = { guide };
-          visualGuideCache.set(guideCacheKey, payload);
-          return payload;
-        });
+          { signal: clientAbort.signal }
+        );
 
         res.setHeader('X-MindFlow-Cache', 'MISS');
         res.json(result);
@@ -2779,6 +3153,7 @@ EDUCATIONAL QUALITY & DESIGN RULES (${isLong ? 'COMPREHENSIVE MULTI-PAGE EDITION
           'visual-guide'
         );
       } finally {
+        cleanupAbort();
         releaseSlot();
       }
     }
@@ -2811,6 +3186,7 @@ EDUCATIONAL QUALITY & DESIGN RULES (${isLong ? 'COMPREHENSIVE MULTI-PAGE EDITION
    */
   app.post(
     '/api/chat',
+    requireAuth,
     withRateLimit(rateLimiters.chat, 'chat'),
     express.json({ limit: '512kb' }),
     async (req, res) => {
@@ -2869,15 +3245,7 @@ EDUCATIONAL QUALITY & DESIGN RULES (${isLong ? 'COMPREHENSIVE MULTI-PAGE EDITION
         : '';
 
       const chatVideoKey = sanitizeUserText(workspace.videoId, 64) || hashCacheKey(String(workspace.title ?? ''));
-      const workspaceFingerprint = hashCacheKey(
-        `${String(workspace.videoId ?? '')}|${String(workspace.title ?? '')}|${
-          Array.isArray(workspace.nodes) ? workspace.nodes.length : 0
-        }|${
-          Array.isArray(workspace.nodes) && workspace.nodes.length > 0
-            ? String((workspace.nodes[0] as Record<string, unknown>)?.title ?? '')
-            : ''
-        }|${Array.isArray(workspace.transcript) ? workspace.transcript.length : 0}`
-      );
+      const workspaceFingerprint = computeWorkspaceContentFingerprint(workspace);
       const chatCacheKey = `chat:${chatVideoKey}:${workspaceFingerprint}:${safeLang}:${hashCacheKey(
         `${cleanQuestion.toLowerCase()}|${recentHistory}`
       )}`;
@@ -2888,29 +3256,29 @@ EDUCATIONAL QUALITY & DESIGN RULES (${isLong ? 'COMPREHENSIVE MULTI-PAGE EDITION
         return;
       }
 
+      if (!(await enforceAiUsage(req, res, 'ai'))) return;
+
       const releaseSlot = acquireAiSlot(req, res);
       if (!releaseSlot) return;
 
-      const clientAbort = new AbortController();
-      req.on('close', () => {
-        if (!res.writableEnded) {
-          clientAbort.abort(new Error('Client connection closed.'));
-        }
-      });
+      const { controller: clientAbort, cleanup: cleanupAbort } =
+        createClientAbortController(res);
 
       try {
-        const result = await inFlight.run(chatCacheKey, async () => {
-          const chatMaxDuration =
-            typeof workspace.videoDurationSeconds === 'number' && workspace.videoDurationSeconds > 0
-              ? workspace.videoDurationSeconds
-              : undefined;
+        const result = await inFlight.run(
+          chatCacheKey,
+          async (sharedSignal) => {
+            const chatMaxDuration =
+              typeof workspace.videoDurationSeconds === 'number' && workspace.videoDurationSeconds > 0
+                ? workspace.videoDurationSeconds
+                : undefined;
 
-          const retrieved = retrieveChatContext(workspace, cleanQuestion, {
-            maxChars: 14000,
-            recentHistoryText: recentHistory,
-          });
+            const retrieved = retrieveChatContext(workspace, cleanQuestion, {
+              maxChars: 14000,
+              recentHistoryText: recentHistory,
+            });
 
-          const prompt = `You are "Ask This Video", a knowledgeable, patient AI study tutor inside MindFlow AI grounded strictly in the current video workspace below.
+            const prompt = `You are "Ask This Video", a knowledgeable, patient AI study tutor inside MindFlow AI grounded strictly in the current video workspace below.
 ${getLanguageInstruction(safeLang)}
 
 TUTOR CAPABILITIES (Adapt your response style to what the student asks):
@@ -2936,56 +3304,58 @@ ${retrieved.contextText}
 ${recentHistory ? `RECENT CONVERSATION:\n${recentHistory}\n` : ''}
 USER QUESTION: ${cleanQuestion}`;
 
-          const response = await generateWithFreeTierFallback(
-            ai,
-            {
-              contents: prompt,
-              config: {
-                responseMimeType: 'application/json',
-                responseSchema: CHAT_RESPONSE_SCHEMA,
-                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            const response = await generateWithFreeTierFallback(
+              ai,
+              {
+                contents: prompt,
+                config: {
+                  responseMimeType: 'application/json',
+                  responseSchema: CHAT_RESPONSE_SCHEMA,
+                  thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+                },
               },
-            },
-            22_000,
-            2,
-            { parentSignal: clientAbort.signal }
-          );
+              22_000,
+              2,
+              { parentSignal: sharedSignal }
+            );
 
-          const rawText = (response.text ?? '').trim();
-          let answer = '';
-          let rawCitations: Array<{ label?: string; seconds?: number; topic?: string }> | undefined;
+            const rawText = (response.text ?? '').trim();
+            let answer = '';
+            let rawCitations: Array<{ label?: string; seconds?: number; topic?: string }> | undefined;
 
-          try {
-            const parsed = extractJsonObject(rawText) as {
-              answer?: string;
-              citations?: Array<{ label?: string; seconds?: number; topic?: string }>;
-            };
-            answer = typeof parsed.answer === 'string' ? parsed.answer.trim() : '';
-            rawCitations = parsed.citations;
-          } catch {
-            // Graceful plain-text fallback if a model returns prose instead of strict JSON
-            if (rawText && !rawText.startsWith('{')) {
-              answer = rawText;
-              rawCitations = [];
-            } else {
-              throw new Error('Could not parse structured JSON from AI response.');
+            try {
+              const parsed = extractJsonObject(rawText) as {
+                answer?: string;
+                citations?: Array<{ label?: string; seconds?: number; topic?: string }>;
+              };
+              answer = typeof parsed.answer === 'string' ? parsed.answer.trim() : '';
+              rawCitations = parsed.citations;
+            } catch {
+              // Graceful plain-text fallback if a model returns prose instead of strict JSON
+              if (rawText && !rawText.startsWith('{')) {
+                answer = rawText;
+                rawCitations = [];
+              } else {
+                throw new Error('Could not parse structured JSON from AI response.');
+              }
             }
-          }
 
-          if (!answer) {
-            throw new Error('Empty JSON response.');
-          }
+            if (!answer) {
+              throw new Error('Empty JSON response.');
+            }
 
-          const citations = validateChatCitations(
-            rawCitations,
-            retrieved.validTimestampSeconds,
-            chatMaxDuration
-          );
+            const citations = validateChatCitations(
+              rawCitations,
+              retrieved.validTimestampSeconds,
+              chatMaxDuration
+            );
 
-          const payload = { answer, citations };
-          chatCache.set(chatCacheKey, payload);
-          return payload;
-        });
+            const payload = { answer, citations };
+            chatCache.set(chatCacheKey, payload);
+            return payload;
+          },
+          { signal: clientAbort.signal }
+        );
 
         res.setHeader('X-MindFlow-Cache', 'MISS');
         res.json(result);
@@ -2997,6 +3367,7 @@ USER QUESTION: ${cleanQuestion}`;
           'chat'
         );
       } finally {
+        cleanupAbort();
         releaseSlot();
       }
     }
@@ -3059,6 +3430,17 @@ USER QUESTION: ${cleanQuestion}`;
       fs.existsSync(path.join(__dirname, 'assets'))
         ? __dirname
         : path.resolve(__dirname, 'dist');
+
+    // Never expose the compiled backend server bundle when dist/server.js lives inside distDir
+    app.use((req, res, next) => {
+      const normalizedPath = req.path.toLowerCase();
+      if (normalizedPath === '/server.js' || normalizedPath === '/server.js.map') {
+        res.status(404).end();
+        return;
+      }
+      next();
+    });
+
     app.use(
       '/assets',
       express.static(path.join(distDir, 'assets'), {
@@ -3096,7 +3478,9 @@ USER QUESTION: ${cleanQuestion}`;
   }
 
   const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`MindFlow AI server listening on http://localhost:${PORT}`);
+    console.log(
+      `MindFlow AI server listening on http://localhost:${PORT} (${isProduction ? 'production' : 'development'})`
+    );
   });
 
   const gracefulShutdown = (signal: string) => {

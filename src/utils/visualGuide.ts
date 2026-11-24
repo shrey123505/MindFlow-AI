@@ -112,29 +112,34 @@ export function sanitizeSvgDiagram(
 
   // Strip dangerous block tags and their contents
   cleaned = cleaned.replace(
-    /<(script|foreignObject|iframe|object|embed|style|link|meta|audio|video|animate|set)[^>]*>[\s\S]*?<\/\1>/gi,
+    /<(script|foreignObject|iframe|object|embed|style|link|meta|audio|video|animate|animateTransform|animateMotion|set|handler)[^>]*>[\s\S]*?<\/\1>/gi,
     ''
   );
-  // Strip self-closing dangerous tags & external image/use fetches
+  // Strip self-closing dangerous tags & external image/use/animation fetches
   cleaned = cleaned.replace(
-    /<(script|foreignObject|iframe|object|embed|style|link|meta|image|use|feImage)[^>]*\/?>/gi,
+    /<(script|foreignObject|iframe|object|embed|style|link|meta|image|use|feImage|animate|animateTransform|animateMotion|set|handler)[^>]*\/?>/gi,
     ''
   );
 
   // Strip inline event handlers (onload, onclick, onerror, etc.)
-  cleaned = cleaned.replace(/\son[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '');
+  cleaned = cleaned.replace(/[\s/]on[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, ' ');
 
-  // Strip javascript:, vbscript:, and data: URI schemes inside attributes
+  // Strip javascript:, vbscript:, external URLs, and data: URI schemes inside attributes
   cleaned = cleaned.replace(
-    /(href|xlink:href|src)\s*=\s*("[^"]*"|'[^']*')/gi,
+    /(href|xlink:href|src)\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi,
     (_match, attr: string, value: string) => {
-      const inner = value.slice(1, -1).trim();
+      const inner =
+        (value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))
+          ? value.slice(1, -1).trim()
+          : value.trim();
       if (/^#[A-Za-z0-9_-]+$/.test(inner)) {
         return `${attr}="${inner}"`;
       }
       return '';
     }
   );
+  cleaned = cleaned.replace(/url\(\s*['"]?\s*(?:https?:|data:|javascript:|\/\/)[^)]*\)/gi, 'none');
   cleaned = cleaned.replace(/javascript\s*:/gi, '');
   cleaned = cleaned.replace(/vbscript\s*:/gi, '');
   cleaned = cleaned.replace(/data\s*:\s*text\/html/gi, '');

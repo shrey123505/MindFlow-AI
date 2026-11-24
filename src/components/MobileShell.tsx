@@ -9,12 +9,14 @@ import {
   Lightbulb,
   Link2,
   Loader2,
+  LogIn,
   MessageCircle,
   Network,
   Play,
   ScrollText,
   Sparkles,
   X,
+  UserRound,
 } from 'lucide-react';
 import type {
   ActiveTab,
@@ -26,6 +28,7 @@ import type {
 import { LanguageSwitcher } from './LanguageSwitcher';
 import { NodeIcon } from './NodeIcon';
 import { isSafeHttpUrl } from '../utils/youtube';
+import type { AccountUsage, AccountUser } from '../types/auth';
 
 interface MobileHeaderProps {
   urlOpen: boolean;
@@ -36,12 +39,15 @@ interface MobileHeaderProps {
   isAnalyzing: boolean;
   isTranslating: boolean;
   libraryCount: number;
+  accountUser: AccountUser | null;
+  accountUsage: AccountUsage | null;
   onToggleUrlBar: () => void;
   onUrlChange: (val: string) => void;
   onUrlClear: () => void;
   onUrlSubmit: () => void;
   onLanguageChange: (lang: LanguageCode) => void;
   onOpenLibrary: () => void;
+  onOpenAccount: () => void;
   onOpenManualTranscript: () => void;
 }
 
@@ -54,12 +60,15 @@ export function MobileHeader({
   isAnalyzing,
   isTranslating,
   libraryCount,
+  accountUser,
+  accountUsage,
   onToggleUrlBar,
   onUrlChange,
   onUrlClear,
   onUrlSubmit,
   onLanguageChange,
   onOpenLibrary,
+  onOpenAccount,
   onOpenManualTranscript,
 }: MobileHeaderProps) {
   const handleSubmit = (e: FormEvent) => {
@@ -86,6 +95,30 @@ export function MobileHeader({
             compact
             onChange={onLanguageChange}
           />
+
+          <button
+            type="button"
+            data-testid="mobile-account-btn"
+            onClick={onOpenAccount}
+            aria-label={accountUser ? `Account for ${accountUser.email}` : 'Sign in or create an account'}
+            title={
+              accountUser
+                ? `${accountUsage?.analysesUsed ?? 0}/${accountUsage?.analysisLimit ?? 3} video analyses today`
+                : 'Sign in or create an account'
+            }
+            className="relative flex h-9 w-9 sm:h-10 sm:w-10 items-center justify-center rounded-xl border border-white/10 bg-white/[0.05] text-slate-300 transition-colors hover:text-white cursor-pointer"
+          >
+            {accountUser ? (
+              <UserRound className="h-4 w-4 text-cyan-300" aria-hidden="true" />
+            ) : (
+              <LogIn className="h-4 w-4 text-cyan-300" aria-hidden="true" />
+            )}
+            {accountUser && accountUsage && (
+              <span className="absolute -right-1 -top-1 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-violet-500 px-1 text-[9px] font-bold text-white">
+                {Math.max(0, accountUsage.analysisLimit - accountUsage.analysesUsed)}
+              </span>
+            )}
+          </button>
 
           <button
             type="button"

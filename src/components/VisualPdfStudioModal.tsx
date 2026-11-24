@@ -46,8 +46,8 @@ interface VisualPdfStudioModalProps {
   isLoading: boolean;
   error: string | null;
   onClose: () => void;
-  onRetry: () => void;
-  onGenerateLongGuide: () => void;
+  onRetry: (options?: { includeDiagrams?: boolean }) => void;
+  onGenerateLongGuide: (options?: { includeDiagrams?: boolean }) => void;
   onNotify: (message: string, variant?: 'success' | 'error' | 'info') => void;
 }
 
@@ -462,7 +462,7 @@ export function VisualPdfStudioModal({
             <div className="hidden lg:flex items-center gap-1.5">
               <button
                 type="button"
-                onClick={onGenerateLongGuide}
+                onClick={() => onGenerateLongGuide({ includeDiagrams: showDiagrams })}
                 disabled={isLoading || pdfStatus === 'rendering'}
                 data-testid="generate-long-ai-pdf-btn"
                 title="Use AI to expand this video into a comprehensive 6–8 chapter long-form visual PDF"
@@ -702,7 +702,7 @@ export function VisualPdfStudioModal({
                   type="button"
                   onClick={() => {
                     setMobileOptionsOpen(false);
-                    onGenerateLongGuide();
+                    onGenerateLongGuide({ includeDiagrams: showDiagrams });
                   }}
                   disabled={isLoading || pdfStatus === 'rendering'}
                   className="inline-flex items-center justify-center gap-1.5 rounded-xl bg-violet-500/15 hover:bg-violet-500/25 border border-violet-400/35 px-3 py-2 min-h-[40px] text-xs font-semibold text-violet-100 cursor-pointer disabled:opacity-45"
@@ -869,7 +869,7 @@ export function VisualPdfStudioModal({
             <p className="text-sm font-semibold text-rose-200">{error}</p>
             <button
               type="button"
-              onClick={onRetry}
+              onClick={() => onRetry({ includeDiagrams: showDiagrams })}
               className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-violet-600 to-cyan-500 px-4 py-2 text-xs font-semibold text-white cursor-pointer"
             >
               <RefreshCw className="w-3.5 h-3.5" aria-hidden="true" />
